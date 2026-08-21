@@ -16,6 +16,15 @@ from .core.stt import SpeechToText
 MIN_DURATION_SECONDS = 0.35
 
 
+def _is_model_cached(model_size: str) -> bool:
+    import os
+    from pathlib import Path
+    hub = Path(os.environ.get(
+        "HF_HOME", Path.home() / ".cache" / "huggingface")) / "hub"
+    return hub.is_dir() and any(
+        hub.glob(f"models--*faster-whisper-{model_size}"))
+
+
 class AppController(QObject):
     """組裝熱鍵→錄音→禁音→STT→AI 的核心流程，用 signal 回報 UI。"""
 
@@ -54,8 +63,11 @@ class AppController(QObject):
 
     def _load_model(self):
         size = self.stt.model_size
-        self.state_changed.emit(
-            "loading", f"正在載入語音模型（{size}），首次執行會自動下載…")
+        if _is_model_cached(size):
+            self.state_changed.emit("loading", f"正在載入語音模型（{size}）…")
+        else:
+            self.state_changed.emit(
+                "loading", f"首次使用 {size} 模型，正在下載（之後會存在本機，不再重下）…")
         try:
             self.stt.load()
         except Exception as e:
@@ -81,6 +93,34 @@ class AppController(QObject):
             self.hotkey.configure(hotkey_type, key_name)
         except ValueError as e:
             self.error_occurred.emit(str(e))
+
+    # ---- 文字輸入翻譯（GUI 執行緒呼叫）----
+
+    def translate_text(self, text: str):
+        text = text.strip()
+        if not text:
+            return
+        if self._session_active:
+            self.state_changed.emit("processing", "還在處理上一句，請稍候…")
+            return
+        self._session_active = True
+        self._executor.submit(self._process_text, text)
+
+    def _process_text(self, text: str):
+        try:
+            self.state_changed.emit("processing", "AI 梳理與翻譯中…")
+            try:
+                provider = create_provider(self.config.get("ai", default={}))
+                result = provider.refine_and_translate(text)
+            except TranslationError as e:
+                self.result_ready.emit(text, "", "")
+                self.state_changed.emit("error", f"翻譯失敗：{e}")
+                return
+            self.result_ready.emit(text, result.refined, result.english)
+            self.state_changed.emit("idle", "完成")
+            self._handle_outputs(result.english)
+        finally:
+            self._session_active = False
 
     # ---- 熱鍵回呼（pynput 執行緒）----
 

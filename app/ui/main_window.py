@@ -1,4 +1,5 @@
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QKeySequence, QShortcut
 from PySide6.QtWidgets import QApplication, QHBoxLayout, QVBoxLayout, QWidget
 
 from qfluentwidgets import (
@@ -8,14 +9,17 @@ from qfluentwidgets import (
     InfoBar,
     InfoBarPosition,
     PrimaryPushButton,
+    PushButton,
     StrongBodyLabel,
     TextEdit,
     TitleLabel,
     ToolButton,
+    TransparentToolButton,
 )
 
 from ..config import Config
 from ..controller import AppController
+from .bubble import BubbleWidget
 from .settings_page import SettingsInterface
 
 STATE_COLORS = {
@@ -30,6 +34,8 @@ HOTKEY_DISPLAY = {"keyboard": "鍵盤", "mouse": "滑鼠"}
 
 
 class HomeInterface(QWidget):
+    translate_requested = Signal(str)
+
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
         self.setObjectName("homeInterface")
@@ -39,8 +45,14 @@ class HomeInterface(QWidget):
         layout.setContentsMargins(36, 24, 36, 24)
         layout.setSpacing(12)
 
+        top_row = QHBoxLayout()
         self.hint_label = TitleLabel("", self)
-        layout.addWidget(self.hint_label)
+        top_row.addWidget(self.hint_label)
+        top_row.addStretch(1)
+        self.bubble_button = TransparentToolButton(FluentIcon.MINIMIZE, self)
+        self.bubble_button.setToolTip("縮成懸浮球")
+        top_row.addWidget(self.bubble_button)
+        layout.addLayout(top_row)
 
         status_row = QHBoxLayout()
         self.status_dot = CaptionLabel("●", self)
@@ -58,6 +70,19 @@ class HomeInterface(QWidget):
         self.copy_button.clicked.connect(
             lambda: self.copy_text(self.english_edit.toPlainText()))
         layout.addWidget(self.copy_button)
+
+        layout.addSpacing(4)
+        layout.addWidget(CaptionLabel("或直接輸入中文（Ctrl+Enter 送出）", self))
+        self.input_edit = TextEdit(self)
+        self.input_edit.setFixedHeight(64)
+        self.input_edit.setPlaceholderText("在這裡輸入中文，AI 一樣會先梳理再翻譯")
+        layout.addWidget(self.input_edit)
+        self.translate_button = PushButton(FluentIcon.SEND, "翻譯輸入的文字", self)
+        self.translate_button.clicked.connect(self._submit_text)
+        layout.addWidget(self.translate_button)
+        QShortcut(QKeySequence("Ctrl+Return"), self.input_edit,
+                  self._submit_text,
+                  context=Qt.ShortcutContext.WidgetShortcut)
 
         self.refresh_hint()
         self.set_state("loading", "啟動中…")
@@ -101,27 +126,41 @@ class HomeInterface(QWidget):
             "已複製", "", parent=self, duration=1500,
             position=InfoBarPosition.TOP_RIGHT)
 
+    def _submit_text(self):
+        text = self.input_edit.toPlainText().strip()
+        if text:
+            self.translate_requested.emit(text)
+
 
 class MainWindow(FluentWindow):
     def __init__(self, config: Config, controller: AppController):
         super().__init__()
         self.config = config
         self.controller = controller
+        self._force_quit = False
 
         self.setWindowTitle("AI 語音中翻英")
-        self.resize(760, 640)
+        self.resize(760, 760)
 
         self.home = HomeInterface(config, self)
         self.settings = SettingsInterface(config, self)
         self.addSubInterface(self.home, FluentIcon.MICROPHONE, "翻譯")
         self.addSubInterface(self.settings, FluentIcon.SETTING, "設定")
 
+        self.bubble = BubbleWidget()
+        self.bubble.clicked.connect(self._restore_from_bubble)
+        self.bubble.close_requested.connect(self._quit)
+
         controller.state_changed.connect(self.home.set_state)
+        controller.state_changed.connect(
+            lambda state, _msg: self.bubble.set_state(state))
         controller.result_ready.connect(self.home.show_result)
         controller.error_occurred.connect(self._show_error)
         controller.copy_requested.connect(
             lambda text: QApplication.clipboard().setText(text))
 
+        self.home.bubble_button.clicked.connect(self.hide_to_bubble)
+        self.home.translate_requested.connect(controller.translate_text)
         self.settings.hotkey_changed.connect(self._on_hotkey_changed)
         self.settings.stt_model_changed.connect(controller.reload_model)
 
@@ -134,6 +173,26 @@ class MainWindow(FluentWindow):
             "錯誤", message, parent=self, duration=5000,
             position=InfoBarPosition.TOP_RIGHT)
 
-    def closeEvent(self, event):
+    def hide_to_bubble(self):
+        self.hide()
+        self.bubble.show()
+
+    def _restore_from_bubble(self):
+        self.bubble.hide()
+        self.showNormal()
+        self.activateWindow()
+
+    def _quit(self):
+        self._force_quit = True
+        self.bubble.hide()
         self.controller.shutdown()
-        super().closeEvent(event)
+        QApplication.quit()
+
+    def closeEvent(self, event):
+        # Qt6 的 quit() 會先對所有視窗發 close 事件，被 ignore 會取消 quit，
+        # 所以真正退出時必須 accept；平常按 X 則收成懸浮球
+        if self._force_quit:
+            event.accept()
+            return
+        event.ignore()
+        self.hide_to_bubble()

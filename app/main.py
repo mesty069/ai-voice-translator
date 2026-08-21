@@ -12,6 +12,8 @@ from app.ui.main_window import MainWindow
 
 def main():
     app = QApplication(sys.argv)
+    # 視窗收成懸浮球時主視窗會 hide，不能因此結束程式
+    app.setQuitOnLastWindowClosed(False)
 
     config = Config()
     theme = config.get("ui", "theme", default="auto")
