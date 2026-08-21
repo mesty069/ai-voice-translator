@@ -1,0 +1,29 @@
+{
+  "ai": {
+    "provider": "deepseek",
+    "deepseek": {
+      "api_key": "在這裡填入你的 DeepSeek API key",
+      "base_url": "https://api.deepseek.com",
+      "model": "deepseek-chat"
+    }
+  },
+  "stt": {
+    "model_size": "small",
+    "device": "cpu",
+    "compute_type": "int8"
+  },
+  "hotkey": {
+    "type": "keyboard",
+    "key": "f9"
+  },
+  "output": {
+    "auto_copy": false,
+    "tts_enabled": false,
+    "tts_device": "default"
+  },
+  "mute_other_apps": true,
+  "ui": {
+    "theme": "auto",
+    "theme_color": "#0078d4"
+  }
+}

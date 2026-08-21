@@ -1,0 +1,10 @@
+PySide6>=6.6
+PySide6-Fluent-Widgets
+faster-whisper
+sounddevice
+soundfile
+numpy
+pycaw
+pynput
+requests
+pyttsx3
