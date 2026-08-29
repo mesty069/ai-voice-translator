@@ -78,11 +78,14 @@ class SpeechToText:
     def transcribe(self, audio: np.ndarray, language: str = "zh") -> str:
         if self._model is None:
             raise RuntimeError("語音模型尚未載入完成")
-        segments, _info = self._model.transcribe(
-            audio,
-            language=language,
-            beam_size=5,
-            vad_filter=True,
-            initial_prompt="以下是繁體中文的句子。" if language == "zh" else None,
-        )
-        return "".join(seg.text for seg in segments).strip()
+        # 麥克風與系統字幕兩條管線共用同一個模型，必須序列化，
+        # 否則會同時擠 GPU 造成拖慢甚至崩潰
+        with self._lock:
+            segments, _info = self._model.transcribe(
+                audio,
+                language=language,
+                beam_size=5,
+                vad_filter=True,
+                initial_prompt="以下是繁體中文的句子。" if language == "zh" else None,
+            )
+            return "".join(seg.text for seg in segments).strip()
