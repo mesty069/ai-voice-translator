@@ -17,7 +17,6 @@ class SystemCaptionsController(QObject):
 
     caption_ready = Signal(str, str)      # 原文, 母語翻譯
     state_changed = Signal(str, str)      # state, message
-    error_occurred = Signal(str)          # 暫時性錯誤：只提示，功能繼續開著
     fatal_error = Signal(str)             # 致命錯誤：擷取死掉、模型載不起來 → 關閉功能
 
     MAX_QUEUE = 3  # 積壓超過就丟掉最舊的，即時性優先

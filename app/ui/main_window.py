@@ -235,8 +235,8 @@ class MainWindow(FluentWindow):
         self.system_subtitle = SystemSubtitleOverlay(config)
         self.system_captions.caption_ready.connect(self._on_system_caption)
         self.system_captions.state_changed.connect(self.home.set_state)
-        # 暫時性錯誤只提示，功能繼續開著；致命錯誤才連同功能一起關掉
-        self.system_captions.error_occurred.connect(self._show_error)
+        # 暫時性錯誤只走 state_changed("error", ...) 顯示在狀態列，
+        # 不彈跳窗（每段音訊都可能失敗一次，彈窗太吵）；致命錯誤才彈窗並關掉功能
         self.system_captions.fatal_error.connect(self._show_error)
         self.system_captions.fatal_error.connect(
             lambda _msg: self.set_system_captions_enabled(False))

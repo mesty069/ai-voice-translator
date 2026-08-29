@@ -163,7 +163,6 @@ def test_stale_capture_error_is_ignored(tmp_path):
     cfg, ctrl = _controller(tmp_path)
     ctrl._capture_factory = lambda **kw: _FakeCapture()
     errors = []
-    ctrl.error_occurred.connect(errors.append)
     ctrl.fatal_error.connect(errors.append)
     ctrl.start()
     old_gen = ctrl._generation
