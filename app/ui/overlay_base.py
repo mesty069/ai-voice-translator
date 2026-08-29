@@ -151,3 +151,31 @@ class DraggableResizableOverlay(QWidget):
             self._on_geometry_changed()
         else:
             self._on_simple_click(event.position().toPoint())
+
+
+def push_away(mover, fixed, bounds, margin: int = 12):
+    """算出 mover 要移到哪裡才不會和 fixed 重疊（只上下移動）。
+
+    mover / fixed / bounds 都是 QRect；回傳新的左上角 QPoint。
+    不重疊就原樣回傳。優先往移動距離較短、且放得下的方向讓開。
+    """
+    from PySide6.QtCore import QPoint, QRect
+
+    padded = fixed.adjusted(-margin, -margin, margin, margin)
+    if not mover.intersects(padded):
+        return mover.topLeft()
+
+    up_y = fixed.top() - margin - mover.height()
+    down_y = fixed.bottom() + margin + 1
+    candidates = []
+    if up_y >= bounds.top():
+        candidates.append((abs(up_y - mover.top()), up_y))
+    if down_y + mover.height() <= bounds.bottom():
+        candidates.append((abs(down_y - mover.top()), down_y))
+    if not candidates:
+        # 兩邊都放不下：貼著邊界，至少不要跑出畫面
+        y = max(bounds.top(),
+                min(down_y, bounds.bottom() - mover.height()))
+        return QPoint(mover.left(), y)
+    candidates.sort()
+    return QPoint(mover.left(), candidates[0][1])
