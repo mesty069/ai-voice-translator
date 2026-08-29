@@ -444,7 +444,9 @@ class SubtitleOverlay(DraggableResizableOverlay):
     def mousePressEvent(self, event):
         super().mousePressEvent(event)
         # 開始操作（拖動或縮放）就先停止倒數，放開時由 _on_geometry_changed 重啟
-        self._hide_timer.stop()
+        # 非左鍵（右鍵/中鍵）基底類別完全不處理，不能停倒數，否則永遠不會重啟
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._hide_timer.stop()
 
     def _on_simple_click(self, pos):
         # 編輯中點卡片其他地方 → 視同完成編輯（重新翻譯）

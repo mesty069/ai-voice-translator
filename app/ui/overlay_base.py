@@ -1,8 +1,6 @@
 from PySide6.QtCore import QPoint, QSize, Qt
 from PySide6.QtWidgets import QApplication, QWidget
 
-_MAX = 16777215
-
 
 class DraggableResizableOverlay(QWidget):
     """無邊框浮層的共用行為：拖動移動、邊框/角落縮放、位置大小記憶、透明度。
@@ -112,9 +110,14 @@ class DraggableResizableOverlay(QWidget):
                            else Qt.CursorShape.ArrowCursor)
             return
         if not self._moved:
-            if (gpos - self._press_global).manhattanLength() < self.DRAG_THRESHOLD:
+            # 邊框縮放：跟舊行為一致，一動就套用，沒有閾值判斷
+            # （閾值只用來區分「內部單擊」跟「內部拖曳」）
+            if self._resize_edges:
+                self._moved = True
+            elif (gpos - self._press_global).manhattanLength() < self.DRAG_THRESHOLD:
                 return
-            self._moved = True
+            else:
+                self._moved = True
         if self._resize_edges:
             self._apply_resize(gpos)
         else:
