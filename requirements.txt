@@ -1,10 +1,20 @@
 PySide6>=6.6
 PySide6-Fluent-Widgets
 faster-whisper
+# GPU（NVIDIA）加速用的 CUDA 執行期函式庫；純 CPU 環境可拿掉
+nvidia-cublas-cu12
+nvidia-cudnn-cu12
 sounddevice
 soundfile
 numpy
 pycaw
 pynput
 requests
+# 用 Windows 憑證存放區驗證 TLS（防毒/VPN 攔截 HTTPS 時 certifi 會驗證失敗）
+truststore
 pyttsx3
+# 系統聲音擷取（WASAPI loopback）
+soundcard
+# 本機翻譯用的 tokenizer（不會安裝 torch）
+transformers
+sentencepiece
