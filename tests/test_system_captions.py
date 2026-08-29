@@ -99,8 +99,9 @@ def test_waits_while_microphone_is_busy(tmp_path):
 
 def test_queue_drops_backlog_to_stay_realtime(tmp_path):
     cfg, ctrl = _controller(tmp_path)
+    ctrl._running = True
     for _ in range(10):
-        ctrl._on_segment(np.zeros(1600, dtype=np.float32))
+        ctrl._on_segment(np.zeros(1600, dtype=np.float32), ctrl._generation)
     assert ctrl._queue.qsize() <= ctrl.MAX_QUEUE
 
 
@@ -147,6 +148,37 @@ def test_capture_error_wakes_worker(tmp_path):
     ctrl._capture_factory = lambda **kw: _FakeCapture()
     ctrl.start()
     worker = ctrl._worker
-    ctrl._on_capture_error(RuntimeError("裝置消失"))
+    ctrl._on_capture_error(RuntimeError("裝置消失"), ctrl._generation)
     worker.join(timeout=2.0)
     assert not worker.is_alive()
+
+
+def test_stale_capture_error_is_ignored(tmp_path):
+    """重啟後，舊擷取執行緒遲來的錯誤不得影響新一代 worker。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._capture_factory = lambda **kw: _FakeCapture()
+    errors = []
+    ctrl.error_occurred.connect(errors.append)
+    ctrl.start()
+    old_gen = ctrl._generation
+    ctrl.stop()
+    ctrl.start()
+    worker = ctrl._worker
+    ctrl._on_capture_error(RuntimeError("舊裝置消失"), old_gen)
+    assert errors == []
+    assert ctrl._running is True
+    assert worker.is_alive()
+    ctrl.stop()
+
+
+def test_stale_capture_segment_is_dropped(tmp_path):
+    """舊擷取執行緒的音訊段不得進入新一代的佇列。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._capture_factory = lambda **kw: _FakeCapture()
+    ctrl.start()
+    old_gen = ctrl._generation
+    ctrl.stop()
+    ctrl.start()
+    ctrl._on_segment(np.zeros(1600, dtype=np.float32), old_gen)
+    assert ctrl._queue.qsize() == 0
+    ctrl.stop()

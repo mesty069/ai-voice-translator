@@ -64,8 +64,8 @@ class SystemCaptionsController(QObject):
         self._capture = self._capture_factory(
             device_name=self.config.get("system_captions", "device",
                                         default="default"),
-            on_segment=self._on_segment,
-            on_error=self._on_capture_error,
+            on_segment=lambda audio, g=gen: self._on_segment(audio, g),
+            on_error=lambda error, g=gen: self._on_capture_error(error, g),
             silence_ms=self.config.get("system_captions", "segment_silence_ms",
                                        default=600),
             max_seconds=self.config.get("system_captions", "max_segment_sec",
@@ -100,7 +100,9 @@ class SystemCaptionsController(QObject):
 
     # ---- 管線 ----
 
-    def _on_segment(self, audio):
+    def _on_segment(self, audio, gen):
+        if gen != self._generation or not self._running:
+            return  # 舊世代的擷取執行緒，不得餵進新佇列
         # 先取本地變數，避免 start() 同時換新佇列造成 trim/put 對不上
         q = self._queue
         while q.qsize() >= self.MAX_QUEUE:
@@ -110,7 +112,9 @@ class SystemCaptionsController(QObject):
                 break
         q.put(audio)
 
-    def _on_capture_error(self, error):
+    def _on_capture_error(self, error, gen):
+        if gen != self._generation:
+            return  # 舊世代擷取執行緒遲來的錯誤，忽略即可
         self._running = False
         self.error_occurred.emit(f"系統聲音擷取失敗：{error}")
         self.state_changed.emit("error", "系統聲音擷取失敗")
