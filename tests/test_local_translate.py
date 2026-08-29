@@ -1,4 +1,5 @@
 import sys
+import threading
 from pathlib import Path
 
 import pytest
@@ -136,3 +137,104 @@ def test_snapshot_download_survives_no_console(monkeypatch, tmp_path):
                         hub.disable_progress_bars)
     monkeypatch.setattr(sys, "stderr", None)
     assert lt._snapshot_download("some/repo") == str(tmp_path)
+
+
+def test_ensure_loaded_does_not_hold_lock_during_download(monkeypatch, tmp_path):
+    """下載模型（可能好幾分鐘）期間不得持鎖，否則 GUI 執行緒呼叫
+    set_engine / set_compute_device 會整個卡住（未回應）。"""
+    from app.core import local_translate as lt
+
+    class FakeTokenizer:
+        def encode(self, text):
+            return [1]
+
+        def convert_ids_to_tokens(self, ids):
+            return ["a"]
+
+        def convert_tokens_to_ids(self, tokens):
+            return [1]
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "ok"
+
+    class FakeResult:
+        hypotheses = [["lang", "x"]]
+
+    class FakeTranslator:
+        def translate_batch(self, sources, **kwargs):
+            return [FakeResult()]
+
+    translator = lt.LocalTranslator()
+    observed = {}
+
+    def fake_download(repo):
+        # 模擬下載中：此時「別的執行緒」必須也能取得鎖。
+        # _lock 是 RLock，同一條執行緒試取一定成功，所以必須跨執行緒檢查。
+        def probe():
+            observed["free"] = translator._lock.acquire(blocking=False)
+            if observed["free"]:
+                translator._lock.release()
+
+        t = threading.Thread(target=probe)
+        t.start()
+        t.join(timeout=2.0)
+        return str(tmp_path)
+
+    monkeypatch.setattr(lt, "_snapshot_download", fake_download)
+    monkeypatch.setattr(lt, "_load_tokenizer",
+                        lambda path, **kwargs: FakeTokenizer())
+    monkeypatch.setattr(lt, "_make_translator",
+                        lambda path, device, compute_type: FakeTranslator())
+
+    translator.ensure_loaded("en", "zh")
+    assert observed["free"] is True, "下載期間仍持有鎖，GUI 會被凍結"
+
+
+def test_translate_reloads_when_model_is_unloaded_mid_call(monkeypatch, tmp_path):
+    """ensure_loaded 回來後、推論前，若別的執行緒 set_engine 清掉模型，
+    不能拿 None 去推論（舊版會 AttributeError），要重載後再跑。"""
+    from app.core import local_translate as lt
+
+    class FakeTokenizer:
+        def encode(self, text):
+            return [1]
+
+        def convert_ids_to_tokens(self, ids):
+            return ["a"]
+
+        def convert_tokens_to_ids(self, tokens):
+            return [1]
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "翻譯結果"
+
+    class FakeResult:
+        hypotheses = [["lang", "x"]]
+
+    class FakeTranslator:
+        def translate_batch(self, sources, **kwargs):
+            return [FakeResult()]
+
+    downloads = []
+    monkeypatch.setattr(lt, "_snapshot_download",
+                        lambda repo: downloads.append(repo) or str(tmp_path))
+    monkeypatch.setattr(lt, "_load_tokenizer",
+                        lambda path, **kwargs: FakeTokenizer())
+    monkeypatch.setattr(lt, "_make_translator",
+                        lambda path, device, compute_type: FakeTranslator())
+
+    translator = lt.LocalTranslator(compute_device="cpu")
+    original_is_ready = translator.is_ready
+    tripped = []
+
+    def racy_is_ready(src, tgt):
+        ready = original_is_ready(src, tgt)
+        if ready and not tripped:
+            tripped.append(True)
+            translator._unload()   # 模擬此刻另一條執行緒 set_engine
+            return False
+        return ready
+
+    translator.is_ready = racy_is_ready
+    assert translator.translate("hello", "en", "zh") == "翻譯結果"
+    assert len(downloads) == 2, "模型被清掉後應重新載入一次"

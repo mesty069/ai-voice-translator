@@ -128,9 +128,10 @@ class LocalTranslator:
         self._kind = None
         self.device = None
 
-    def _device_candidates(self):
+    @staticmethod
+    def _device_candidates(device_pref):
         """回傳 [(device, compute_type)]，依序嘗試。"""
-        if self.compute_device == "cpu":
+        if device_pref == "cpu":
             return [("cpu", "int8")]
         return [("cuda", "int8_float16"), ("cpu", "int8")]
 
@@ -149,47 +150,65 @@ class LocalTranslator:
         return postprocess(decoded, tgt)
 
     def ensure_loaded(self, src: str, tgt: str, progress_cb=None):
+        """載入（必要時下載）模型。
+
+        下載動輒數百 MB、數分鐘，期間絕不可持鎖：GUI 執行緒會呼叫
+        set_engine / set_compute_device，持鎖會讓整個程式「未回應」。
+        因此只在「檢查」與「最後掛上」兩個瞬間持鎖，中間全放開；
+        下載期間設定被改掉的話，這份成果作廢，下次呼叫會重載。
+        """
         with self._lock:
             if self.is_ready(src, tgt):
                 return
-            repo, kind = repo_for(self.engine, src, tgt)
-            if progress_cb is not None:
-                progress_cb(f"正在準備翻譯模型（{repo}）…")
-            path = _snapshot_download(repo)
-            register_cuda_dll_dirs()
+            engine, device_pref = self.engine, self.compute_device
+            repo, kind = repo_for(engine, src, tgt)
 
-            tokenizer_kwargs = {}
-            if kind == "nllb":
-                tokenizer_kwargs["src_lang"] = NLLB_CODES[src]
-            tokenizer = _load_tokenizer(path, **tokenizer_kwargs)
+        if progress_cb is not None:
+            progress_cb(f"正在準備翻譯模型（{repo}）…")
+        path = _snapshot_download(repo)
+        register_cuda_dll_dirs()
 
-            translator = None
-            used_device = None
-            last_error = None
-            for device, compute_type in self._device_candidates():
-                try:
-                    candidate = _make_translator(path, device, compute_type)
-                    # CTranslate2 的 CUDA 函式庫是延遲載入：建構成功不代表能用，
-                    # 必須真的跑一次推論才會暴露缺 DLL 的錯誤，否則永遠不會退回 CPU
-                    self._run_batch(candidate, tokenizer, kind, "test", tgt)
-                    translator, used_device = candidate, device
-                    break
-                except Exception as e:
-                    last_error = e
-            if translator is None:
-                raise RuntimeError(f"翻譯模型載入失敗：{last_error}")
+        tokenizer_kwargs = {}
+        if kind == "nllb":
+            tokenizer_kwargs["src_lang"] = NLLB_CODES[src]
+        tokenizer = _load_tokenizer(path, **tokenizer_kwargs)
 
+        translator = None
+        used_device = None
+        last_error = None
+        for device, compute_type in self._device_candidates(device_pref):
+            try:
+                candidate = _make_translator(path, device, compute_type)
+                # CTranslate2 的 CUDA 函式庫是延遲載入：建構成功不代表能用，
+                # 必須真的跑一次推論才會暴露缺 DLL 的錯誤，否則永遠不會退回 CPU
+                self._run_batch(candidate, tokenizer, kind, "test", tgt)
+                translator, used_device = candidate, device
+                break
+            except Exception as e:
+                last_error = e
+        if translator is None:
+            raise RuntimeError(f"翻譯模型載入失敗：{last_error}")
+
+        with self._lock:
+            if (self.engine, self.compute_device) != (engine, device_pref):
+                return  # 設定在載入期間被改了，這份結果作廢，下次呼叫會重載
             self._tokenizer = tokenizer
             self._translator = translator
             self._kind = kind
             self.device = used_device
-            self._key = (self.engine, src, tgt)
+            self._key = (engine, src, tgt)
 
-    def translate(self, text: str, src: str, tgt: str) -> str:
+    def translate(self, text: str, src: str, tgt: str, progress_cb=None) -> str:
         text = (text or "").strip()
         if not text:
             return ""
-        self.ensure_loaded(src, tgt)
-        with self._lock:
-            return self._run_batch(self._translator, self._tokenizer,
-                                   self._kind, text, tgt)
+        # ensure_loaded 回來後到取鎖之間，set_engine 可能已經 _unload()，
+        # 所以推論前要在鎖內再確認一次；沒就緒就重載（最多兩輪）
+        for _ in range(2):
+            self.ensure_loaded(src, tgt, progress_cb)
+            with self._lock:
+                if not self.is_ready(src, tgt):
+                    continue
+                return self._run_batch(self._translator, self._tokenizer,
+                                       self._kind, text, tgt)
+        raise RuntimeError("翻譯設定變更過於頻繁，本段跳過")
