@@ -1,0 +1,134 @@
+import queue
+import threading
+import time
+
+from PySide6.QtCore import QObject, Signal
+
+from .local_translate import LocalTranslator
+from .system_audio import SystemAudioCapture
+
+
+class SystemCaptionsController(QObject):
+    """把「系統聲音 → 文字 → 母語翻譯」串起來。
+
+    擷取與處理都在自己的執行緒，不佔用麥克風流程的 executor。
+    麥克風正在使用時先讓路，避免使用者說話被系統字幕的辨識卡住。
+    """
+
+    caption_ready = Signal(str, str)      # 原文, 母語翻譯
+    state_changed = Signal(str, str)      # state, message
+    error_occurred = Signal(str)
+
+    MAX_QUEUE = 3  # 積壓超過就丟掉最舊的，即時性優先
+
+    def __init__(self, config, stt, mic_busy, parent=None):
+        super().__init__(parent)
+        self.config = config
+        self.stt = stt
+        self._mic_busy = mic_busy
+        self._mic_wait_timeout = 10.0
+        self._translator = LocalTranslator(
+            engine=config.get("system_captions", "engine",
+                              default="nllb-600m"),
+            compute_device=config.get("system_captions", "compute_device",
+                                      default="auto"))
+        self._capture = None
+        self._queue = queue.Queue()
+        self._worker = None
+        self._running = False
+
+    # ---- 生命週期 ----
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def start(self):
+        if self._running:
+            return
+        self._running = True
+        self._translator.set_engine(
+            self.config.get("system_captions", "engine", default="nllb-600m"))
+        self._translator.set_compute_device(
+            self.config.get("system_captions", "compute_device",
+                            default="auto"))
+        self._worker = threading.Thread(
+            target=self._work, daemon=True, name="system-captions")
+        self._worker.start()
+        self._capture = SystemAudioCapture(
+            device_name=self.config.get("system_captions", "device",
+                                        default="default"),
+            on_segment=self._on_segment,
+            on_error=self._on_capture_error,
+            silence_ms=self.config.get("system_captions", "segment_silence_ms",
+                                       default=600),
+            max_seconds=self.config.get("system_captions", "max_segment_sec",
+                                        default=8))
+        self._capture.start()
+        self.state_changed.emit("listening", "正在聽系統聲音…")
+
+    def stop(self):
+        # 沒在跑的話直接返回，避免 UI 重複呼叫 stop 時狂洗狀態列
+        if not self._running and self._capture is None:
+            return
+        self._running = False
+        if self._capture is not None:
+            self._capture.stop()
+            self._capture = None
+        self._queue.put(None)  # 叫醒工作執行緒
+        worker, self._worker = self._worker, None
+        if worker is not None:
+            worker.join(timeout=2.0)
+        self.state_changed.emit("idle", "已停止系統聲音字幕")
+
+    # ---- 語言 ----
+
+    def _languages(self):
+        """回傳 (辨識語言, 翻譯目標語言)。"""
+        native = self.config.get("language", "source", default="zh")
+        target = self.config.get("language", "target", default="en")
+        spoken = self.config.get("system_captions", "language", default="")
+        return (spoken or target), native
+
+    # ---- 管線 ----
+
+    def _on_segment(self, audio):
+        while self._queue.qsize() >= self.MAX_QUEUE:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                break
+        self._queue.put(audio)
+
+    def _on_capture_error(self, error):
+        self._running = False
+        self.error_occurred.emit(f"系統聲音擷取失敗：{error}")
+        self.state_changed.emit("error", "系統聲音擷取失敗")
+
+    def _work(self):
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        while self._running:
+            audio = self._queue.get()
+            if audio is None or not self._running:
+                break
+            try:
+                self._process(audio)
+            except Exception as e:
+                self.error_occurred.emit(f"系統字幕處理失敗：{e}")
+
+    def _process(self, audio):
+        # 麥克風優先：使用者正在說話時先讓路
+        deadline = time.monotonic() + self._mic_wait_timeout
+        while self._mic_busy() and time.monotonic() < deadline:
+            time.sleep(0.05)
+
+        spoken, native = self._languages()
+        text = (self.stt.transcribe(audio, language=spoken) or "").strip()
+        if not text:
+            return
+        translated = self._translator.translate(text, spoken, native)
+        self.caption_ready.emit(text, translated)
