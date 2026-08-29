@@ -81,6 +81,12 @@ class SystemCaptionsController(QObject):
         self._running = False
         # 世代先變號，就算舊 worker 之後才醒來，也無法再發訊號或吃到新佇列
         self._generation += 1
+        # 注意：_capture.stop() 內部仍會把累積到一半的尾段 flush 出來，
+        # 但因為上面已經把 _running 關掉、世代也變了，_on_segment 會直接丟棄它
+        # （見下方 _on_segment）。這是刻意的行為，不是漏洞：使用者關掉字幕
+        # 之後（overlay 已經隱藏）不該再冒出新字幕；flush 是 SystemAudioCapture
+        # 自己元件契約的一部分（見 test_stop_flushes_pending_tail），不是為了
+        # 讓 stop() 後還能送出字幕而存在。
         if self._capture is not None:
             self._capture.stop()
             self._capture = None
