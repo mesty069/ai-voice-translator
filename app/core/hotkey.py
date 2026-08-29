@@ -70,32 +70,44 @@ class HotkeyListener:
         return (target_char is not None and pressed_char is not None
                 and pressed_char.lower() == target_char.lower())
 
+    # 回呼一律吞掉例外：例外會讓 pynput 的監聽執行緒整個停掉，
+    # 熱鍵從此完全沒反應。
+
     def _on_key_press(self, key):
-        if not self._matches(key):
-            return
-        with self._lock:
-            if self._active:  # 按住時系統會重複觸發 press
+        try:
+            if not self._matches(key):
                 return
-            self._active = True
-        self.on_press_start()
+            with self._lock:
+                if self._active:  # 按住時系統會重複觸發 press
+                    return
+                self._active = True
+            self.on_press_start()
+        except Exception:
+            pass
 
     def _on_key_release(self, key):
-        if not self._matches(key):
-            return
-        with self._lock:
-            if not self._active:
+        try:
+            if not self._matches(key):
                 return
-            self._active = False
-        self.on_release_end()
+            with self._lock:
+                if not self._active:
+                    return
+                self._active = False
+            self.on_release_end()
+        except Exception:
+            pass
 
     def _on_click(self, x, y, button, pressed):
-        if button != self._target_button:
-            return
-        with self._lock:
-            if pressed == self._active:
+        try:
+            if button != self._target_button:
                 return
-            self._active = pressed
-        if pressed:
-            self.on_press_start()
-        else:
-            self.on_release_end()
+            with self._lock:
+                if pressed == self._active:
+                    return
+                self._active = pressed
+            if pressed:
+                self.on_press_start()
+            else:
+                self.on_release_end()
+        except Exception:
+            pass

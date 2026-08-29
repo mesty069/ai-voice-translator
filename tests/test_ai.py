@@ -11,8 +11,10 @@ from app.ai.deepseek import DeepSeekProvider
 from app.ai.factory import create_provider
 
 
-def _payload(content: str) -> dict:
-    return {"choices": [{"message": {"content": content}}]}
+def _provider_with_response(data: dict) -> DeepSeekProvider:
+    provider = DeepSeekProvider(api_key="sk-x")
+    provider._chat_json = lambda system_prompt, text: data
+    return provider
 
 
 def test_factory_creates_deepseek():
@@ -36,24 +38,45 @@ def test_deepseek_requires_api_key():
 
 
 def test_parse_valid_response():
-    content = json.dumps({"refined": "你好嗎？", "english": "How are you?"},
-                         ensure_ascii=False)
-    result = DeepSeekProvider._parse_response(_payload(content))
+    provider = _provider_with_response(
+        {"refined": "你好嗎？", "translation": "How are you?"})
+    result = provider.refine_and_translate("x", "繁體中文", "英文")
     assert result.refined == "你好嗎？"
     assert result.english == "How are you?"
 
 
-def test_parse_invalid_json_raises():
-    with pytest.raises(TranslationError):
-        DeepSeekProvider._parse_response(_payload("not json"))
-
-
 def test_parse_missing_field_raises():
     with pytest.raises(TranslationError):
-        DeepSeekProvider._parse_response(_payload(json.dumps({"refined": "x"})))
+        _provider_with_response({"refined": "x"}).refine_and_translate("x")
 
 
-def test_parse_empty_english_raises():
+def test_parse_empty_translation_raises():
     with pytest.raises(TranslationError):
-        DeepSeekProvider._parse_response(
-            _payload(json.dumps({"refined": "x", "english": ""})))
+        _provider_with_response(
+            {"refined": "x", "translation": ""}).refine_and_translate("x")
+
+
+def test_prompts_use_language_names():
+    from app.ai.deepseek import grammar_prompt, translate_prompt
+    p = translate_prompt("繁體中文", "日文")
+    assert "繁體中文" in p and "日文" in p
+    g = grammar_prompt("日文")
+    assert "日文" in g
+
+
+def test_grammar_no_errors():
+    result = _provider_with_response(
+        {"has_errors": False, "corrected": "Same."}).check_grammar("Same.")
+    assert not result.has_errors
+
+
+def test_grammar_with_errors():
+    result = _provider_with_response(
+        {"has_errors": True, "corrected": "He went home."}
+    ).check_grammar("He go home.")
+    assert result.has_errors and result.corrected == "He went home."
+
+
+def test_grammar_missing_field_raises():
+    with pytest.raises(TranslationError):
+        _provider_with_response({"has_errors": True}).check_grammar("x")

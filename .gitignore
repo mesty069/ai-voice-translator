@@ -3,3 +3,8 @@ __pycache__/
 *.pyc
 config.json
 .pytest_cache/
+build/
+dist/
+*.spec
+gui_err.log
+.superpowers/

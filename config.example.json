@@ -8,22 +8,44 @@
     }
   },
   "stt": {
-    "model_size": "small",
-    "device": "cpu",
-    "compute_type": "int8"
+    "model_size": "large-v3",
+    "device": "cuda",
+    "compute_type": "int8_float16"
   },
   "hotkey": {
     "type": "keyboard",
     "key": "f9"
   },
+  "replay_hotkey": {
+    "type": "keyboard",
+    "key": ""
+  },
   "output": {
     "auto_copy": false,
-    "tts_enabled": false,
-    "tts_device": "default"
+    "tts_enabled": true,
+    "tts_device": "default",
+    "tts_rate": 200
   },
-  "mute_other_apps": true,
+  "recording": {
+    "device": "default",
+    "isolate_other_devices": true
+  },
+  "subtitle": {
+    "duration_seconds": 10,
+    "font_size": 21,
+    "opacity": 100,
+    "bg_color": "#121212",
+    "font_color": "#ffffff",
+    "font_weight": "bold",
+    "font_family": ""
+  },
+  "float_input": {
+    "enabled": false,
+    "opacity": 100
+  },
   "ui": {
     "theme": "auto",
-    "theme_color": "#0078d4"
+    "theme_color": "#0078d4",
+    "auto_bubble": true
   }
 }
