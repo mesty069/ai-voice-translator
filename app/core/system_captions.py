@@ -33,9 +33,11 @@ class SystemCaptionsController(QObject):
             compute_device=config.get("system_captions", "compute_device",
                                       default="auto"))
         self._capture = None
+        self._capture_factory = SystemAudioCapture
         self._queue = queue.Queue()
         self._worker = None
         self._running = False
+        self._generation = 0   # 每次 start() 遞增；舊 worker 看到不一致就退出、不發訊號
 
     # ---- 生命週期 ----
 
@@ -47,15 +49,19 @@ class SystemCaptionsController(QObject):
         if self._running:
             return
         self._running = True
+        self._generation += 1
+        gen = self._generation
+        # 換新佇列：舊 worker 就算晚醒來也吃不到新的分段
+        self._queue = queue.Queue()
         self._translator.set_engine(
             self.config.get("system_captions", "engine", default="nllb-600m"))
         self._translator.set_compute_device(
             self.config.get("system_captions", "compute_device",
                             default="auto"))
         self._worker = threading.Thread(
-            target=self._work, daemon=True, name="system-captions")
+            target=self._work, args=(gen,), daemon=True, name="system-captions")
         self._worker.start()
-        self._capture = SystemAudioCapture(
+        self._capture = self._capture_factory(
             device_name=self.config.get("system_captions", "device",
                                         default="default"),
             on_segment=self._on_segment,
@@ -72,10 +78,12 @@ class SystemCaptionsController(QObject):
         if not self._running and self._capture is None:
             return
         self._running = False
+        # 世代先變號，就算舊 worker 之後才醒來，也無法再發訊號或吃到新佇列
+        self._generation += 1
         if self._capture is not None:
             self._capture.stop()
             self._capture = None
-        self._queue.put(None)  # 叫醒工作執行緒
+        self._queue.put(None)  # 叫醒目前這個佇列的工作執行緒
         worker, self._worker = self._worker, None
         if worker is not None:
             worker.join(timeout=2.0)
@@ -93,34 +101,39 @@ class SystemCaptionsController(QObject):
     # ---- 管線 ----
 
     def _on_segment(self, audio):
-        while self._queue.qsize() >= self.MAX_QUEUE:
+        # 先取本地變數，避免 start() 同時換新佇列造成 trim/put 對不上
+        q = self._queue
+        while q.qsize() >= self.MAX_QUEUE:
             try:
-                self._queue.get_nowait()
+                q.get_nowait()
             except queue.Empty:
                 break
-        self._queue.put(audio)
+        q.put(audio)
 
     def _on_capture_error(self, error):
         self._running = False
         self.error_occurred.emit(f"系統聲音擷取失敗：{error}")
         self.state_changed.emit("error", "系統聲音擷取失敗")
+        self._queue.put(None)  # 叫醒卡在 queue.get() 的工作執行緒，避免永遠卡住
 
-    def _work(self):
+    def _work(self, gen):
         try:
             import comtypes
             comtypes.CoInitialize()
         except Exception:
             pass
-        while self._running:
+        while self._running and gen == self._generation:
             audio = self._queue.get()
-            if audio is None or not self._running:
+            if gen != self._generation or not self._running:
+                break
+            if audio is None:
                 break
             try:
-                self._process(audio)
+                self._process(audio, gen)
             except Exception as e:
                 self.error_occurred.emit(f"系統字幕處理失敗：{e}")
 
-    def _process(self, audio):
+    def _process(self, audio, gen):
         # 麥克風優先：使用者正在說話時先讓路
         deadline = time.monotonic() + self._mic_wait_timeout
         while self._mic_busy() and time.monotonic() < deadline:
@@ -128,7 +141,11 @@ class SystemCaptionsController(QObject):
 
         spoken, native = self._languages()
         text = (self.stt.transcribe(audio, language=spoken) or "").strip()
+        if gen != self._generation or not self._running:
+            return  # stop() 期間或已重啟，舊結果不發訊號
         if not text:
             return
         translated = self._translator.translate(text, spoken, native)
+        if gen != self._generation or not self._running:
+            return  # translate() 耗時，回來後可能已經被 stop()/重啟
         self.caption_ready.emit(text, translated)
