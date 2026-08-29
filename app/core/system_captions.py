@@ -4,7 +4,7 @@ import time
 
 from PySide6.QtCore import QObject, Signal
 
-from .local_translate import LocalTranslator
+from .local_translate import LocalTranslator, ModelLoadError
 from .system_audio import SystemAudioCapture
 
 
@@ -141,7 +141,7 @@ class SystemCaptionsController(QObject):
             except Exception as e:
                 if gen != self._generation or not self._running:
                     break  # 已經 stop()/重啟，舊世代不得再發訊號
-                if isinstance(e, RuntimeError) and                         str(e).startswith("翻譯模型載入失敗"):
+                if isinstance(e, ModelLoadError):
                     # 模型載不起來，之後每一段都會一樣失敗 → 關掉功能
                     self.fatal_error.emit(str(e))
                     break

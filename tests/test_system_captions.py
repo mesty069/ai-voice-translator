@@ -9,6 +9,7 @@ from PySide6.QtCore import Qt
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from app.config import Config
+from app.core.local_translate import ModelLoadError
 from app.core.system_captions import SystemCaptionsController
 
 
@@ -231,6 +232,64 @@ def test_transient_error_does_not_fatal(tmp_path):
     assert fatals == [], "暫時性錯誤不該觸發致命錯誤（會自動關閉功能）"
     assert any(state == "error" and "boom" in msg for state, msg in states)
     assert ctrl._worker is None
+
+
+def test_model_load_error_is_fatal_and_stops_worker(tmp_path):
+    """翻譯模型下載/載入失敗要用型別（ModelLoadError）判斷致命，不是訊息
+    字串前綴：否則之後每一段都會重新嘗試下載，永遠不會真的停止。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._capture_factory = lambda **kw: _FakeCapture()
+
+    def boom(text, src, tgt, progress_cb=None):
+        raise ModelLoadError("翻譯模型載入失敗：連線逾時")
+
+    ctrl._translator.translate = boom
+    fatals, states = [], []
+    direct = Qt.ConnectionType.DirectConnection
+    ctrl.fatal_error.connect(fatals.append, direct)
+    ctrl.state_changed.connect(lambda s, m: states.append((s, m)), direct)
+
+    ctrl.start()
+    ctrl._queue.put(np.zeros(16000, dtype=np.float32))
+    worker = ctrl._worker
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline and not fatals:
+        time.sleep(0.02)
+    worker.join(timeout=2.0)
+    ctrl.stop()
+
+    assert len(fatals) == 1
+    assert not worker.is_alive(), "模型載不起來要停止 worker，不能每段都重試下載"
+
+
+def test_transient_translate_error_does_not_fatal(tmp_path):
+    """單段翻譯失敗（非 ModelLoadError）只是暫時狀況，不能關掉整個功能；
+    走 state_changed("error", ...)，不是已移除的 error_occurred。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._capture_factory = lambda **kw: _FakeCapture()
+
+    def boom(text, src, tgt, progress_cb=None):
+        raise RuntimeError("x")
+
+    ctrl._translator.translate = boom
+    fatals, states = [], []
+    direct = Qt.ConnectionType.DirectConnection
+    ctrl.fatal_error.connect(fatals.append, direct)
+    ctrl.state_changed.connect(lambda s, m: states.append((s, m)), direct)
+
+    ctrl.start()
+    ctrl._queue.put(np.zeros(16000, dtype=np.float32))
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if any(state == "error" for state, _ in states):
+            break
+        time.sleep(0.02)
+    worker = ctrl._worker
+    assert worker is not None and worker.is_alive(), "暫時性錯誤不能讓 worker 停掉"
+    ctrl.stop()
+
+    assert fatals == []
+    assert any(state == "error" and "x" in msg for state, msg in states)
 
 
 class _LateReadyStt:

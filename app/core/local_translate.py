@@ -42,6 +42,15 @@ ENGINE_LABELS = [
 ]
 
 
+class ModelLoadError(RuntimeError):
+    """翻譯模型下載或載入失敗（網路、tokenizer、推論引擎皆算）。
+
+    呼叫端（system_captions.py）以此類別（而非訊息字串前綴）判斷是否為
+    致命錯誤：一旦模型載不起來，之後每一段都會一樣失敗，必須停止功能，
+    而不是把它當成單段音訊的暫時性錯誤，導致每段都重新嘗試下載。
+    """
+
+
 _opencc = None
 
 
@@ -165,29 +174,35 @@ class LocalTranslator:
 
         if progress_cb is not None:
             progress_cb(f"正在準備翻譯模型（{repo}）…")
-        path = _snapshot_download(repo)
-        register_cuda_dll_dirs()
+        try:
+            path = _snapshot_download(repo)
+            register_cuda_dll_dirs()
 
-        tokenizer_kwargs = {}
-        if kind == "nllb":
-            tokenizer_kwargs["src_lang"] = NLLB_CODES[src]
-        tokenizer = _load_tokenizer(path, **tokenizer_kwargs)
+            tokenizer_kwargs = {}
+            if kind == "nllb":
+                tokenizer_kwargs["src_lang"] = NLLB_CODES[src]
+            tokenizer = _load_tokenizer(path, **tokenizer_kwargs)
 
-        translator = None
-        used_device = None
-        last_error = None
-        for device, compute_type in self._device_candidates(device_pref):
-            try:
-                candidate = _make_translator(path, device, compute_type)
-                # CTranslate2 的 CUDA 函式庫是延遲載入：建構成功不代表能用，
-                # 必須真的跑一次推論才會暴露缺 DLL 的錯誤，否則永遠不會退回 CPU
-                self._run_batch(candidate, tokenizer, kind, "test", tgt)
-                translator, used_device = candidate, device
-                break
-            except Exception as e:
-                last_error = e
-        if translator is None:
-            raise RuntimeError(f"翻譯模型載入失敗：{last_error}")
+            translator = None
+            used_device = None
+            last_error = None
+            for device, compute_type in self._device_candidates(device_pref):
+                try:
+                    candidate = _make_translator(path, device, compute_type)
+                    # CTranslate2 的 CUDA 函式庫是延遲載入：建構成功不代表能用，
+                    # 必須真的跑一次推論才會暴露缺 DLL 的錯誤，否則永遠不會退回 CPU
+                    self._run_batch(candidate, tokenizer, kind, "test", tgt)
+                    translator, used_device = candidate, device
+                    break
+                except Exception as e:
+                    last_error = e
+            if translator is None:
+                raise RuntimeError(str(last_error))
+        except Exception as e:
+            # 不論是下載失敗（網路）、tokenizer 載入失敗，還是所有裝置都
+            # 推論失敗，一律視為致命：以 ModelLoadError（而非訊息字串）
+            # 讓呼叫端能明確分辨，不必用字串前綴判斷。
+            raise ModelLoadError(f"翻譯模型載入失敗：{e}") from e
 
         with self._lock:
             if (self.engine, self.compute_device) != (engine, device_pref):
