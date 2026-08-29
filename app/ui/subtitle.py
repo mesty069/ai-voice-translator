@@ -1,4 +1,4 @@
-from PySide6.QtCore import QPoint, QPropertyAnimation, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPropertyAnimation, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QFont, QPainter
 from PySide6.QtWidgets import (
     QApplication,
@@ -6,7 +6,6 @@ from PySide6.QtWidgets import (
     QLabel,
     QTextEdit,
     QVBoxLayout,
-    QWidget,
 )
 
 from qfluentwidgets import (
@@ -18,6 +17,7 @@ from qfluentwidgets import (
 )
 
 from .float_input import EnterSubmitFilter
+from .overlay_base import DraggableResizableOverlay
 
 _FLAGS = (Qt.WindowType.FramelessWindowHint
           | Qt.WindowType.WindowStaysOnTopHint
@@ -29,7 +29,6 @@ DEFAULT_DURATION_SECONDS = 10
 DEFAULT_FONT_SIZE = 21
 DEFAULT_BG_COLOR = "#121212"
 DEFAULT_FONT_COLOR = "#ffffff"
-BORDER = 8          # 邊框拖曳調整大小的感應寬度
 _MAX = 16777215
 
 FONT_WEIGHTS = {
@@ -42,7 +41,7 @@ FONT_WEIGHTS = {
 }
 
 
-class SubtitleOverlay(QWidget):
+class SubtitleOverlay(DraggableResizableOverlay):
     """懸浮球模式下的字幕：顯示梳理後中文＋英文翻譯，數秒後淡出。
 
     - 顯示秒數與字體大小依 config 的 subtitle 區段
@@ -52,24 +51,16 @@ class SubtitleOverlay(QWidget):
     - 不搶焦點（遊戲/通話中不會被切走）
     """
 
+    CONFIG_SECTION = "subtitle"
+
     replay_requested = Signal()
     rate_changed = Signal(int)          # 朗讀語速（與設定頁同一個值）
     retranslate_requested = Signal(str)  # 使用者改完中文 → 重新翻譯
-    _DRAG_THRESHOLD = 6
 
     def __init__(self, config):
-        super().__init__(None, _FLAGS)
-        self.config = config
+        super().__init__(config, _FLAGS)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
-        self.setMouseTracking(True)
-
-        self._pressed = False
-        self._moved = False
-        self._drag_offset = QPoint()
-        self._resize_edges = None      # (left, right, top, bottom) 按下時的邊
-        self._press_geo = None
-        self._press_global = QPoint()
 
         outer = QHBoxLayout(self)
         outer.setContentsMargins(28, 20, 16, 18)
@@ -202,7 +193,7 @@ class SubtitleOverlay(QWidget):
             "subtitle", "font_size", default=DEFAULT_FONT_SIZE))
         return max(12, round(en * 0.72)), en
 
-    def _min_size(self) -> QSize:
+    def min_overlay_size(self) -> QSize:
         """最小尺寸隨字體連動：至少放得下中英各一行與邊距。"""
         zh, en = self._font_sizes()
         min_w = max(240, en * 6) + 28 + 16 + 102  # 102 = 控制欄（語速拖桿）寬
@@ -285,14 +276,10 @@ class SubtitleOverlay(QWidget):
             "subtitle", "duration_seconds", default=DEFAULT_DURATION_SECONDS)
         return max(3, int(seconds)) * 1000
 
-    def _target_opacity(self) -> float:
-        percent = self.config.get("subtitle", "opacity", default=100)
-        return max(0.3, min(1.0, int(percent) / 100))
-
     def apply_opacity(self):
         """設定頁調整時即時套用（顯示中且沒在淡入淡出才動）。"""
         if self.isVisible() and self._fade.state() != QPropertyAnimation.State.Running:
-            self.setWindowOpacity(self._target_opacity())
+            self.setWindowOpacity(self.target_opacity())
 
     def _on_replay(self):
         # 重播期間字幕重新計時，聽的時候不會消失
@@ -380,32 +367,21 @@ class SubtitleOverlay(QWidget):
 
     # ---- 顯示 ----
 
-    def _saved_pos(self):
-        x = self.config.get("subtitle", "pos_x", default=None)
-        y = self.config.get("subtitle", "pos_y", default=None)
-        if x is None or y is None:
-            return None
-        pos = QPoint(int(x), int(y))
-        # 儲存的位置必須還在某個螢幕上（拔掉外接螢幕後回到預設位置）
-        if QApplication.screenAt(pos) is None:
-            return None
-        return pos
-
     def _popup(self, screen, duration_ms: int):
         self.busy_ring.hide()
-        saved_pos = self._saved_pos()
+        saved_pos = self.saved_pos()
         if saved_pos is not None:
             screen = QApplication.screenAt(saved_pos)
         screen = screen or QApplication.primaryScreen()
         geo = screen.availableGeometry()
 
-        min_size = self._min_size()
+        min_size = self.min_overlay_size()
         self.setMinimumSize(min_size)
         self.setMaximumSize(_MAX, _MAX)
 
-        saved_w = self.config.get("subtitle", "width", default=None)
-        saved_h = self.config.get("subtitle", "height", default=None)
-        if saved_w and saved_h:
+        saved_size = self.saved_size()
+        if saved_size is not None:
+            saved_w, saved_h = saved_size
             width = max(int(saved_w), min_size.width())
             height = max(int(saved_h), min_size.height())
         else:
@@ -432,7 +408,7 @@ class SubtitleOverlay(QWidget):
             self.setWindowOpacity(0.0)
             self.show()
         self._fade.setStartValue(self.windowOpacity())
-        self._fade.setEndValue(self._target_opacity())
+        self._fade.setEndValue(self.target_opacity())
         self._fade.start()
         if not self._reading:  # 朗讀中不倒數，播完由 set_reading 重啟
             self._hide_timer.start(duration_ms)
@@ -463,98 +439,24 @@ class SubtitleOverlay(QWidget):
             self._relayout()
         super().resizeEvent(event)
 
-    # ---- 滑鼠互動：邊框調大小、內部拖曳移動、單擊關閉 ----
-
-    def _edges_at(self, pos):
-        left = pos.x() <= BORDER
-        right = pos.x() >= self.width() - BORDER
-        top = pos.y() <= BORDER
-        bottom = pos.y() >= self.height() - BORDER
-        if left or right or top or bottom:
-            return (left, right, top, bottom)
-        return None
-
-    def _cursor_for(self, edges):
-        left, right, top, bottom = edges
-        if (left and top) or (right and bottom):
-            return Qt.CursorShape.SizeFDiagCursor
-        if (left and bottom) or (right and top):
-            return Qt.CursorShape.SizeBDiagCursor
-        if left or right:
-            return Qt.CursorShape.SizeHorCursor
-        return Qt.CursorShape.SizeVerCursor
+    # ---- 滑鼠互動：邊框調大小、內部拖曳移動、單擊關閉（通用行為見基底類別）----
 
     def mousePressEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton:
-            return
-        self._pressed = True
-        self._moved = False
-        self._press_global = event.globalPosition().toPoint()
-        self._press_geo = self.geometry()
-        self._resize_edges = self._edges_at(event.position().toPoint())
-        self._drag_offset = self._press_global - self.frameGeometry().topLeft()
-        if self._resize_edges:
-            self._hide_timer.stop()
+        super().mousePressEvent(event)
+        # 開始操作（拖動或縮放）就先停止倒數，放開時由 _on_geometry_changed 重啟
+        self._hide_timer.stop()
 
-    def mouseMoveEvent(self, event):
-        pos = event.position().toPoint()
-        gpos = event.globalPosition().toPoint()
-        if not self._pressed:
-            edges = self._edges_at(pos)
-            self.setCursor(self._cursor_for(edges) if edges
-                           else Qt.CursorShape.ArrowCursor)
+    def _on_simple_click(self, pos):
+        # 編輯中點卡片其他地方 → 視同完成編輯（重新翻譯）
+        if self._editing:
+            self._finish_edit()
             return
-        if self._resize_edges:
-            self._moved = True
-            self._apply_resize(gpos)
-            return
-        if not self._moved:
-            if (gpos - self._press_global).manhattanLength() < self._DRAG_THRESHOLD:
-                return
-            self._moved = True
-            self._hide_timer.stop()  # 拖動期間不要倒數消失
-        self.move(gpos - self._drag_offset)
+        # 點在原文行上 → 進入編輯；點其他地方 → 關閉
+        if self.zh_label.isVisible() and self.zh_label.geometry().contains(pos):
+            self._begin_edit()
+        else:
+            self.dismiss()
 
-    def _apply_resize(self, gpos):
-        left, right, top, bottom = self._resize_edges
-        geo = self._press_geo
-        dx = gpos.x() - self._press_global.x()
-        dy = gpos.y() - self._press_global.y()
-        min_size = self.minimumSize()
-        x, y, w, h = geo.x(), geo.y(), geo.width(), geo.height()
-        if right:
-            w = max(min_size.width(), geo.width() + dx)
-        if bottom:
-            h = max(min_size.height(), geo.height() + dy)
-        if left:
-            w = max(min_size.width(), geo.width() - dx)
-            x = geo.x() + geo.width() - w
-        if top:
-            h = max(min_size.height(), geo.height() - dy)
-            y = geo.y() + geo.height() - h
-        self.setGeometry(x, y, w, h)
-
-    def mouseReleaseEvent(self, event):
-        if event.button() != Qt.MouseButton.LeftButton or not self._pressed:
-            return
-        self._pressed = False
-        edges, self._resize_edges = self._resize_edges, None
-        if not self._moved:
-            # 編輯中點卡片其他地方 → 視同完成編輯（重新翻譯）
-            if self._editing:
-                self._finish_edit()
-                return
-            # 點在中文行上 → 進入編輯；點其他地方 → 關閉
-            if self.zh_label.isVisible() and self.zh_label.geometry().contains(
-                    event.position().toPoint()):
-                self._begin_edit()
-            else:
-                self.dismiss()
-            return
-        # 記住新位置與大小，重新開始倒數
-        self.config.set("subtitle", "pos_x", self.pos().x())
-        self.config.set("subtitle", "pos_y", self.pos().y())
-        if edges:
-            self.config.set("subtitle", "width", self.width())
-            self.config.set("subtitle", "height", self.height())
+    def _on_geometry_changed(self):
+        self.save_geometry()
         self._hide_timer.start(self._duration_ms())
