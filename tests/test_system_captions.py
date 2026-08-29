@@ -324,3 +324,29 @@ def test_waits_for_stt_ready(tmp_path):
     assert states and states[0][0] == "loading"
     assert captions == [("hello world", "你好世界")]
     assert fatals == []
+
+
+class _NeverReadyStt:
+    """模擬語音模型永遠不會就緒（例如載入卡死）。"""
+
+    is_ready = False
+
+    def transcribe(self, audio, language="zh"):
+        raise AssertionError("不該辨識：STT 從未就緒")
+
+
+def test_stt_wait_timeout_is_fatal(tmp_path):
+    """語音模型一直沒就緒：等到逾時要當成致命錯誤，不能無限等下去，
+    也不能悄悄跳過該段。STT_WAIT_TIMEOUT 是類別屬性，測試可以覆寫成很短。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl.STT_WAIT_TIMEOUT = 0.05
+    ctrl.stt = _NeverReadyStt()
+    ctrl._running = True
+    fatals, captions = [], []
+    ctrl.fatal_error.connect(fatals.append)
+    ctrl.caption_ready.connect(lambda a, b: captions.append((a, b)))
+
+    ctrl._process(np.zeros(16000, dtype=np.float32), ctrl._generation)
+
+    assert fatals == ["語音模型載入逾時，系統字幕已停止"]
+    assert captions == []
