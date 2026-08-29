@@ -126,6 +126,8 @@ soundcard
 # 本機翻譯用的 tokenizer（不會安裝 torch）
 transformers
 sentencepiece
+# 簡體→台灣繁體（NLLB 以簡體解碼品質才完整）
+opencc-python-reimplemented
 ```
 
 驗證沒有意外安裝 torch：
@@ -152,7 +154,7 @@ git commit -m "feat: 新增系統聲音字幕的設定區段與相依套件"
 - Consumes: 無
 - Produces:
   - `SAMPLE_RATE = 16000`、`DEFAULT_DEVICE = "default"`、`BLOCK_FRAMES = 1600`
-  - `SegmentAccumulator(sample_rate=16000, silence_ms=600, max_seconds=8.0, min_seconds=0.8, threshold=0.008)`；`push(frames) -> list[np.ndarray]`、`drain() -> np.ndarray | None`
+  - `SegmentAccumulator(sample_rate=16000, silence_ms=600, max_seconds=8.0, min_seconds=0.8, quiet_ratio=0.2, min_peak=0.01)`；`push(frames) -> list[np.ndarray]`、`drain() -> np.ndarray | None`
   - `SystemAudioCapture(device_name="default", on_segment=None, on_error=None, silence_ms=600, max_seconds=8.0)`；`start()`、`stop()`、`is_running`、靜態 `list_output_devices() -> list[str]`
 
 - [ ] **Step 1: 寫失敗測試**
@@ -226,6 +228,27 @@ def test_drain_returns_pending_audio():
     tail = acc.drain()
     assert tail is not None
     assert len(tail) >= int(SAMPLE_RATE * 1.0)
+
+
+def _background(seconds, amplitude=0.03):
+    """模擬桌面持續背景音（實測本機為 0.03 以上）。"""
+    n = int(SAMPLE_RATE * seconds)
+    t = np.arange(n) / SAMPLE_RATE
+    return (amplitude * np.sin(2 * np.pi * 60 * t)).astype(np.float32)
+
+
+def test_constant_background_does_not_block_segmentation():
+    """回歸測試：持續背景音高於任何固定門檻時，仍要切得出段落。"""
+    acc = SegmentAccumulator(silence_ms=600, min_seconds=0.8)
+    audio = np.concatenate([_background(1.0), _speech(2.0), _background(1.5)])
+    segments = _feed(acc, audio)
+    assert len(segments) == 1
+
+
+def test_pure_silence_segment_is_discarded_on_force_cut():
+    """整段都是數位靜音時，即使觸發強制切段也不該送出。"""
+    acc = SegmentAccumulator(silence_ms=600, max_seconds=2.0, min_seconds=0.5)
+    assert _feed(acc, _silence(6.0)) == []
 ```
 
 - [ ] **Step 2: 執行測試確認失敗**
@@ -250,55 +273,74 @@ BLOCK_FRAMES = 1600  # 0.1 秒
 class SegmentAccumulator:
     """把連續音框切成一句一句。純邏輯、無音訊裝置相依，方便測試。
 
-    規則：偵測到語音才開始收；語音後靜音達 silence_ms 就送出；
-    連續語音超過 max_seconds 強制切段（切完仍視為語音進行中）；
-    長度不足 min_seconds 的段落丟棄（雜訊、短促聲響）。
+    刻意不用「絕對音量門檻」：桌面環境常有持續背景音（其他程式的聲音、
+    麥克風監聽回送），實測背景 RMS 可達 0.03 以上，絕對門檻會讓程式
+    永遠認為「一直有人在講話」而切不出任何一段。
+
+    改用兩個判準：
+    - 停頓＝音量低於「本段目前最大音量」的 quiet_ratio 倍（相對判斷，
+      不受背景音絕對大小影響，影片播到一半才開始擷取也成立）
+    - 純數位靜音＝整段最大音量都低於 min_peak，直接丟棄
+    另外累計「非停頓」的長度，太短的段落（雜訊、短促聲響）丟棄。
     """
 
     def __init__(self, sample_rate=SAMPLE_RATE, silence_ms=600,
-                 max_seconds=8.0, min_seconds=0.8, threshold=0.008):
+                 max_seconds=8.0, min_seconds=0.8,
+                 quiet_ratio=0.2, min_peak=0.01):
         self.sample_rate = sample_rate
         self.silence_samples = int(sample_rate * silence_ms / 1000)
         self.max_samples = int(sample_rate * max_seconds)
         self.min_samples = int(sample_rate * min_seconds)
-        self.threshold = threshold
+        self.quiet_ratio = quiet_ratio
+        self.min_peak = min_peak
         self._buf = []
         self._buf_len = 0
-        self._silence_run = 0
-        self._has_speech = False
+        self._quiet_run = 0
+        self._speech_len = 0
+        self._peak = 0.0
+
+    @staticmethod
+    def _level(frames) -> float:
+        """用 RMS 而非尖峰值：對雜訊比較不敏感。"""
+        return float(np.sqrt(np.mean(frames.astype(np.float64) ** 2)))
 
     def push(self, frames) -> list:
         frames = np.asarray(frames, dtype=np.float32).reshape(-1)
         if len(frames) == 0:
             return []
-        peak = float(np.abs(frames).max())
-        if peak >= self.threshold:
-            self._has_speech = True
-            self._silence_run = 0
-        elif self._has_speech:
-            self._silence_run += len(frames)
-        if not self._has_speech:
-            return []
+        level = self._level(frames)
+        self._peak = max(self._peak, level)
+        # 一律收進緩衝：段落內的短停頓要保留，語音才連續、辨識才準
         self._buf.append(frames)
         self._buf_len += len(frames)
-        if self._silence_run >= self.silence_samples:
-            seg = self._flush(keep_speech=False)
+        if level < self._peak * self.quiet_ratio:
+            self._quiet_run += len(frames)
+        else:
+            self._quiet_run = 0
+            self._speech_len += len(frames)
+        if self._quiet_run >= self.silence_samples:
+            seg = self._flush()
             return [seg] if seg is not None else []
         if self._buf_len >= self.max_samples:
-            seg = self._flush(keep_speech=True)
+            seg = self._flush()
             return [seg] if seg is not None else []
         return []
 
     def drain(self):
         """停止擷取時把還沒送出的尾巴取出。"""
-        return self._flush(keep_speech=False)
+        return self._flush()
 
-    def _flush(self, keep_speech):
-        buf, length = self._buf, self._buf_len
+    def _flush(self):
+        buf, speech_len, peak = self._buf, self._speech_len, self._peak
         self._buf, self._buf_len = [], 0
-        self._silence_run = 0
-        self._has_speech = keep_speech
-        if not buf or length < self.min_samples:
+        self._quiet_run = 0
+        self._speech_len = 0
+        self._peak = 0.0
+        if not buf:
+            return None
+        if peak < self.min_peak:          # 純數位靜音
+            return None
+        if speech_len < self.min_samples:  # 有聲部分太短
             return None
         return np.concatenate(buf)
 
@@ -379,7 +421,7 @@ class SystemAudioCapture:
 - [ ] **Step 4: 執行測試確認通過**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，28 passed
+Expected: PASS，30 passed
 
 - [ ] **Step 5: 實機驗證真的收得到系統聲音**
 
@@ -487,8 +529,11 @@ Expected: FAIL，`ModuleNotFoundError: No module named 'app.core.local_translate
 import threading
 
 # 程式的語言代碼 → NLLB-200 的語言代碼
+# 中文刻意用簡體 zho_Hans 解碼再以 OpenCC 轉台灣繁體：NLLB 的繁體訓練資料
+# 遠少於簡體，直接用 zho_Hant 會系統性地在逗號後截斷（實測 6 句中 3 句），
+# 換 zho_Hans 全部完整。
 NLLB_CODES = {
-    "zh": "zho_Hant",
+    "zh": "zho_Hans",
     "en": "eng_Latn",
     "ja": "jpn_Jpan",
     "ko": "kor_Hang",
@@ -629,7 +674,7 @@ class LocalTranslator:
 - [ ] **Step 4: 執行測試確認通過**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，35 passed
+Expected: PASS，37 passed
 
 - [ ] **Step 5: 實機驗證翻譯品質（會下載約 600MB，只做一次）**
 
@@ -738,7 +783,7 @@ Expected: FAIL，`assert 4 == 1`（或 2/3，總之大於 1）
 - [ ] **Step 4: 執行測試確認通過**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，36 passed
+Expected: PASS，38 passed
 
 - [ ] **Step 5: 確認麥克風流程沒被拖慢**
 
@@ -1022,7 +1067,7 @@ class SystemCaptionsController(QObject):
 - [ ] **Step 4: 執行測試確認通過**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，43 passed
+Expected: PASS，45 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1268,7 +1313,7 @@ class SubtitleOverlay(DraggableResizableOverlay):
 - [ ] **Step 3: 執行既有測試確認沒改壞**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，43 passed
+Expected: PASS，45 passed
 
 - [ ] **Step 4: 離屏驗證字幕互動全部正常**
 
@@ -1596,7 +1641,7 @@ def push_away(mover, fixed, bounds, margin: int = 12):
 - [ ] **Step 4: 執行測試確認通過**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，48 passed
+Expected: PASS，50 passed
 
 - [ ] **Step 5: Commit**
 
@@ -1815,7 +1860,7 @@ from ..core.system_audio import SystemAudioCapture
 - [ ] **Step 5: 執行測試與離屏驗證**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，48 passed
+Expected: PASS，50 passed
 
 接著執行 Task 10 Step 4 的離屏驗證指令。
 Expected: 全部為 True
@@ -2079,7 +2124,7 @@ Expected: 上述每一項都成立；字幕延遲約在講完一句後 1 秒內�
 - [ ] **Step 4: 全套測試與 lint 檢查**
 
 Run: `.venv\Scripts\python.exe -m pytest tests -q`
-Expected: PASS，48 passed
+Expected: PASS，50 passed
 
 Run: `.venv/Scripts/python.exe -c "import app.main, app.ui.main_window, app.ui.system_subtitle, app.core.system_captions; print('imports OK')"`
 Expected: `imports OK`

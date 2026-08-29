@@ -46,7 +46,9 @@
   - `nllb-1.3b` → 同系列 1.3B（約 1.3GB，品質較好、較慢）
   - `opus-mt` → `gaudi/opus-mt-{src}-{tgt}-ctranslate2`（約 80MB／語言對）
 - 首次使用才用 `huggingface_hub` 下載，過程回報進度給狀態列。
-- 語言代碼映射：程式碼（zh/en/ja…）→ NLLB 代碼（zho_Hant/eng_Latn/jpn_Jpan…）。
+- 語言代碼映射：程式碼（zh/en/ja…）→ NLLB 代碼（eng_Latn/jpn_Jpan…）。
+  **中文以 `zho_Hans` 解碼再用 OpenCC（s2twp）轉台灣繁體**：實測 NLLB-600M 用
+  `zho_Hant` 會在逗號後系統性截斷（6 句中 3 句），簡體解碼則全部完整。
 - `translate(text, src, tgt) -> str`；內部有鎖，GPU 不可用或 OOM 時自動退回 CPU。
 
 ### `app/core/system_captions.py` — `SystemCaptionsController`（QObject）
