@@ -94,13 +94,17 @@ def test_reload_does_not_race_transcribe():
 
     threads = [threading.Thread(target=transcriber) for _ in range(3)]
     threads.append(threading.Thread(target=reloader))
-    for t in threads:
-        t.start()
-    time.sleep(1.0)
-    stop.set()
-    for t in threads:
-        t.join(timeout=5.0)
-    sys.setswitchinterval(original_interval)
+    try:
+        for t in threads:
+            t.start()
+        time.sleep(1.0)
+        stop.set()
+        for t in threads:
+            t.join(timeout=5.0)
+    finally:
+        # 就算下面的 assert 失敗，也不能讓 1e-6 的切換間隔漏到其他測試，
+        # 否則整個測試套件都會被拖慢、甚至誘發不相關的競態。
+        sys.setswitchinterval(original_interval)
 
     assert not errors, f"reload 與 transcribe 有競態：{errors[:3]}"
 
