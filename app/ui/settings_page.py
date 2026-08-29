@@ -23,7 +23,9 @@ from qfluentwidgets import (
 from ..config import Config, LANGUAGES, lang_display
 from ..core import tts
 from ..core.hotkey import MOUSE_BUTTONS
+from ..core.local_translate import ENGINE_LABELS
 from ..core.recorder import DEFAULT_DEVICE, list_input_devices
+from ..core.system_audio import SystemAudioCapture
 
 STT_MODELS = ["tiny", "base", "small", "medium", "large-v3"]
 
@@ -131,6 +133,8 @@ class SettingsInterface(ScrollArea):
     error_requested = Signal(str)
     settings_reset = Signal()
     languages_changed = Signal()
+    system_captions_toggled = Signal(bool)
+    system_captions_settings_changed = Signal()
 
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
@@ -201,6 +205,44 @@ class SettingsInterface(ScrollArea):
         self.grammar_hotkey_button = PushButton("", self.view)
         self.grammar_hotkey_button.setToolTip("點一下，然後按任意按鍵或滑鼠鍵")
         self._add_row(layout, "文法檢查熱鍵", self.grammar_hotkey_button)
+
+        # ---- 系統聲音字幕 ----
+        layout.addSpacing(8)
+        layout.addWidget(StrongBodyLabel("系統聲音字幕", self.view))
+        self.system_captions_switch = SwitchButton(self.view)
+        self._add_row(layout, "啟用（把電腦播放的聲音即時翻成母語字幕）",
+                      self.system_captions_switch)
+        self.system_hotkey_button = PushButton("", self.view)
+        self.system_hotkey_button.setToolTip("點一下，然後按任意按鍵或滑鼠鍵")
+        self._add_row(layout, "系統字幕開關熱鍵", self.system_hotkey_button)
+        self.system_device_combo = ComboBox(self.view)
+        self.system_device_combo.addItem("系統預設")
+        try:
+            self.system_device_combo.addItems(
+                SystemAudioCapture.list_output_devices())
+        except Exception:
+            pass
+        self._add_row(layout, "擷取來源（哪個喇叭的聲音）",
+                      self.system_device_combo)
+        self.system_language_combo = ComboBox(self.view)
+        self.system_language_combo.addItem("跟隨目標語言")
+        self.system_language_combo.addItems([n for _, n in LANGUAGES])
+        self._add_row(layout, "系統聲音的語言", self.system_language_combo)
+        self.system_engine_combo = ComboBox(self.view)
+        self.system_engine_combo.addItems([n for _, n in ENGINE_LABELS])
+        self._add_row(layout, "本機翻譯模型", self.system_engine_combo)
+        self.system_compute_combo = ComboBox(self.view)
+        self.system_compute_combo.addItems(["自動（優先 GPU）", "只用 CPU"])
+        self._add_row(layout, "翻譯運算裝置", self.system_compute_combo)
+        self.system_font_spin = SpinBox(self.view)
+        self.system_font_spin.setRange(12, 48)
+        self.system_font_spin.setSuffix(" px")
+        self._add_row(layout, "系統字幕字體大小", self.system_font_spin)
+        self.system_opacity_spin = SpinBox(self.view)
+        self.system_opacity_spin.setRange(30, 100)
+        self.system_opacity_spin.setSingleStep(5)
+        self.system_opacity_spin.setSuffix(" %")
+        self._add_row(layout, "系統字幕透明度", self.system_opacity_spin)
 
         # ---- 輸出 ----
         layout.addSpacing(8)
@@ -408,6 +450,32 @@ class SettingsInterface(ScrollArea):
             if value.lower() == color.lower():
                 self.color_combo.setCurrentIndex(i)
 
+        sc = "system_captions"
+        self.system_captions_switch.setChecked(
+            cfg.get(sc, "enabled", default=False))
+        self.system_device_combo.setCurrentIndex(0)
+        device = cfg.get(sc, "device", default="default")
+        if device != "default":
+            for i in range(1, self.system_device_combo.count()):
+                if self.system_device_combo.itemText(i) == device:
+                    self.system_device_combo.setCurrentIndex(i)
+                    break
+        self.system_language_combo.setCurrentIndex(0)
+        spoken = cfg.get(sc, "language", default="")
+        if spoken:
+            codes = [c for c, _ in LANGUAGES]
+            if spoken in codes:
+                self.system_language_combo.setCurrentIndex(
+                    codes.index(spoken) + 1)
+        engine = cfg.get(sc, "engine", default="nllb-600m")
+        engine_ids = [e for e, _ in ENGINE_LABELS]
+        if engine in engine_ids:
+            self.system_engine_combo.setCurrentIndex(engine_ids.index(engine))
+        self.system_compute_combo.setCurrentIndex(
+            1 if cfg.get(sc, "compute_device", default="auto") == "cpu" else 0)
+        self.system_font_spin.setValue(cfg.get(sc, "font_size", default=20))
+        self.system_opacity_spin.setValue(cfg.get(sc, "opacity", default=100))
+
     def _refresh_hotkey_button(self):
         self.hotkey_button.setText(hotkey_display(
             self.config.get("hotkey", "type", default="keyboard"),
@@ -421,6 +489,10 @@ class SettingsInterface(ScrollArea):
         self.grammar_hotkey_button.setText(hotkey_display(
             self.config.get("grammar", "hotkey_type", default="keyboard"),
             self.config.get("grammar", "hotkey_key", default="f10")))
+        self.system_hotkey_button.setText(hotkey_display(
+            self.config.get("system_captions", "hotkey_type",
+                            default="keyboard"),
+            self.config.get("system_captions", "hotkey_key", default="f11")))
 
     # ---- 變更 → 存檔 ----
 
@@ -483,6 +555,23 @@ class SettingsInterface(ScrollArea):
 
         self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
         self.color_combo.currentIndexChanged.connect(self._on_color_changed)
+
+        self.system_captions_switch.checkedChanged.connect(
+            self._on_system_captions_switch)
+        self.system_hotkey_button.clicked.connect(
+            self._on_system_hotkey_button)
+        self.system_device_combo.currentIndexChanged.connect(
+            self._on_system_settings_changed)
+        self.system_language_combo.currentIndexChanged.connect(
+            self._on_system_settings_changed)
+        self.system_engine_combo.currentIndexChanged.connect(
+            self._on_system_settings_changed)
+        self.system_compute_combo.currentIndexChanged.connect(
+            self._on_system_settings_changed)
+        self.system_font_spin.valueChanged.connect(
+            self._on_system_settings_changed)
+        self.system_opacity_spin.valueChanged.connect(
+            self._on_system_settings_changed)
 
     def _save(self, *keys_and_value):
         if self._loading:
@@ -681,3 +770,51 @@ class SettingsInterface(ScrollArea):
         value = THEME_COLORS[index][1]
         self.config.set("ui", "theme_color", value)
         setThemeColor(QColor(value))
+
+    def _on_system_captions_switch(self, checked: bool):
+        if self._loading:
+            return
+        # config 寫入由 MainWindow.set_system_captions_enabled 統一處理
+        self.system_captions_toggled.emit(checked)
+
+    def set_system_captions_checked(self, checked: bool):
+        """由主視窗回寫（熱鍵或字幕 ✕ 改了狀態時同步 UI）。"""
+        self._loading = True
+        self.system_captions_switch.setChecked(checked)
+        self._loading = False
+
+    def _on_system_settings_changed(self, _value=None):
+        if self._loading:
+            return
+        sc = "system_captions"
+        index = self.system_device_combo.currentIndex()
+        self.config.set(sc, "device", "default" if index == 0
+                        else self.system_device_combo.currentText())
+        lang_index = self.system_language_combo.currentIndex()
+        self.config.set(sc, "language", "" if lang_index == 0
+                        else LANGUAGES[lang_index - 1][0])
+        self.config.set(sc, "engine",
+                        ENGINE_LABELS[self.system_engine_combo.currentIndex()][0])
+        self.config.set(sc, "compute_device",
+                        "cpu" if self.system_compute_combo.currentIndex() == 1
+                        else "auto")
+        self.config.set(sc, "font_size", self.system_font_spin.value())
+        self.config.set(sc, "opacity", self.system_opacity_spin.value())
+        self.system_captions_settings_changed.emit()
+
+    def _on_system_hotkey_button(self):
+        self.hotkey_capture_started.emit()
+        dialog = HotkeyCaptureDialog(self.window())
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            taken = self._existing_hotkeys() | {
+                (self.config.get("grammar", "hotkey_type", default="keyboard"),
+                 self.config.get("grammar", "hotkey_key", default="f10"))}
+            if (dialog.result_type, dialog.result_key) in taken:
+                self.error_requested.emit("系統字幕熱鍵不能跟其他熱鍵相同")
+            else:
+                self.config.set("system_captions", "hotkey_type",
+                                dialog.result_type)
+                self.config.set("system_captions", "hotkey_key",
+                                dialog.result_key)
+                self._refresh_hotkey_button()
+        self.hotkey_changed.emit()
