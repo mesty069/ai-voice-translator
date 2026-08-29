@@ -10,57 +10,74 @@ BLOCK_FRAMES = 1600  # 0.1 秒
 class SegmentAccumulator:
     """把連續音框切成一句一句。純邏輯、無音訊裝置相依，方便測試。
 
-    規則：偵測到語音才開始收；語音後靜音達 silence_ms 就送出；
-    連續語音超過 max_seconds 強制切段（切完仍視為語音進行中）；
-    長度不足 min_seconds 的段落丟棄（雜訊、短促聲響）。
+    刻意不用「絕對音量門檻」：桌面環境常有持續背景音（其他程式的聲音、
+    麥克風監聽回送），實測背景 RMS 可達 0.03 以上，絕對門檻會讓程式
+    永遠認為「一直有人在講話」而切不出任何一段。
+
+    改用兩個判準：
+    - 停頓＝音量低於「本段目前最大音量」的 quiet_ratio 倍（相對判斷，
+      不受背景音絕對大小影響，影片播到一半才開始擷取也成立）
+    - 純數位靜音＝整段最大音量都低於 min_peak，直接丟棄
+    另外累計「非停頓」的長度，太短的段落（雜訊、短促聲響）丟棄。
     """
 
     def __init__(self, sample_rate=SAMPLE_RATE, silence_ms=600,
-                 max_seconds=8.0, min_seconds=0.8, threshold=0.008):
+                 max_seconds=8.0, min_seconds=0.8,
+                 quiet_ratio=0.2, min_peak=0.01):
         self.sample_rate = sample_rate
         self.silence_samples = int(sample_rate * silence_ms / 1000)
         self.max_samples = int(sample_rate * max_seconds)
         self.min_samples = int(sample_rate * min_seconds)
-        self.threshold = threshold
+        self.quiet_ratio = quiet_ratio
+        self.min_peak = min_peak
         self._buf = []
         self._buf_len = 0
-        self._silence_run = 0
-        self._has_speech = False
+        self._quiet_run = 0
+        self._speech_len = 0
+        self._peak = 0.0
+
+    @staticmethod
+    def _level(frames) -> float:
+        """用 RMS 而非尖峰值：對雜訊比較不敏感。"""
+        return float(np.sqrt(np.mean(frames.astype(np.float64) ** 2)))
 
     def push(self, frames) -> list:
         frames = np.asarray(frames, dtype=np.float32).reshape(-1)
         if len(frames) == 0:
             return []
-        peak = float(np.abs(frames).max())
-        is_speech = peak >= self.threshold
-        if is_speech:
-            self._has_speech = True
-            self._silence_run = 0
-        elif self._has_speech:
-            self._silence_run += len(frames)
-        if not self._has_speech:
-            return []
-        if is_speech:
-            self._buf.append(frames)
-            self._buf_len += len(frames)
-        if self._silence_run >= self.silence_samples:
-            seg = self._flush(keep_speech=False)
+        level = self._level(frames)
+        self._peak = max(self._peak, level)
+        # 一律收進緩衝：段落內的短停頓要保留，語音才連續、辨識才準
+        self._buf.append(frames)
+        self._buf_len += len(frames)
+        if level < self._peak * self.quiet_ratio:
+            self._quiet_run += len(frames)
+        else:
+            self._quiet_run = 0
+            self._speech_len += len(frames)
+        if self._quiet_run >= self.silence_samples:
+            seg = self._flush()
             return [seg] if seg is not None else []
         if self._buf_len >= self.max_samples:
-            seg = self._flush(keep_speech=True)
+            seg = self._flush()
             return [seg] if seg is not None else []
         return []
 
     def drain(self):
         """停止擷取時把還沒送出的尾巴取出。"""
-        return self._flush(keep_speech=False)
+        return self._flush()
 
-    def _flush(self, keep_speech):
-        buf, length = self._buf, self._buf_len
+    def _flush(self):
+        buf, speech_len, peak = self._buf, self._speech_len, self._peak
         self._buf, self._buf_len = [], 0
-        self._silence_run = 0
-        self._has_speech = keep_speech
-        if not buf or length < self.min_samples:
+        self._quiet_run = 0
+        self._speech_len = 0
+        self._peak = 0.0
+        if not buf:
+            return None
+        if peak < self.min_peak:          # 純數位靜音
+            return None
+        if speech_len < self.min_samples:  # 有聲部分太短
             return None
         return np.concatenate(buf)
 
