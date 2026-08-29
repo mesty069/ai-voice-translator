@@ -76,12 +76,15 @@ class SpeechToText:
         return self._model is not None
 
     def transcribe(self, audio: np.ndarray, language: str = "zh") -> str:
-        if self._model is None:
-            raise RuntimeError("語音模型尚未載入完成")
         # 麥克風與系統字幕兩條管線共用同一個模型，必須序列化，
-        # 否則會同時擠 GPU 造成拖慢甚至崩潰
+        # 否則會同時擠 GPU 造成拖慢甚至崩潰。
+        # 檢查與取用都要在鎖內、且取本地變數：在鎖外檢查的話，
+        # reload() 會在檢查後把 _model 清成 None，進了鎖就 AttributeError。
         with self._lock:
-            segments, _info = self._model.transcribe(
+            model = self._model
+            if model is None:
+                raise RuntimeError("語音模型尚未載入完成")
+            segments, _info = model.transcribe(
                 audio,
                 language=language,
                 beam_size=5,

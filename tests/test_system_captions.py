@@ -4,6 +4,7 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from PySide6.QtCore import Qt
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
@@ -12,6 +13,8 @@ from app.core.system_captions import SystemCaptionsController
 
 
 class _FakeStt:
+    is_ready = True
+
     def __init__(self):
         self.languages = []
 
@@ -24,8 +27,10 @@ class _FakeTranslator:
     def __init__(self):
         self.calls = []
 
-    def translate(self, text, src, tgt):
+    def translate(self, text, src, tgt, progress_cb=None):
         self.calls.append((text, src, tgt))
+        if progress_cb is not None:
+            self.progress_cb = progress_cb
         return "你好世界"
 
     def set_engine(self, engine):
@@ -159,6 +164,7 @@ def test_stale_capture_error_is_ignored(tmp_path):
     ctrl._capture_factory = lambda **kw: _FakeCapture()
     errors = []
     ctrl.error_occurred.connect(errors.append)
+    ctrl.fatal_error.connect(errors.append)
     ctrl.start()
     old_gen = ctrl._generation
     ctrl.stop()
@@ -182,3 +188,81 @@ def test_stale_capture_segment_is_dropped(tmp_path):
     ctrl._on_segment(np.zeros(1600, dtype=np.float32), old_gen)
     assert ctrl._queue.qsize() == 0
     ctrl.stop()
+
+
+def test_queue_trim_keeps_newest(tmp_path):
+    """佇列滿了要丟最舊的，留下最新的三段（即時性優先）。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._running = True
+    for i in range(5):
+        ctrl._on_segment(np.full(4, float(i), dtype=np.float32),
+                         ctrl._generation)
+    kept = []
+    while not ctrl._queue.empty():
+        kept.append(float(ctrl._queue.get_nowait()[0]))
+    assert kept == [2.0, 3.0, 4.0]
+
+
+def test_transient_error_does_not_fatal(tmp_path):
+    """單段處理失敗只是暫時狀況（例如某段音訊有問題），
+    不能因此把整個系統字幕功能關掉。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._capture_factory = lambda **kw: _FakeCapture()
+
+    def boom(audio, language="zh"):
+        raise ValueError("boom")
+
+    ctrl.stt.transcribe = boom
+    fatals, states = [], []
+    # worker 是另一條執行緒，測試裡沒有事件迴圈可以派送佇列式連線，
+    # 所以明確用 DirectConnection（正式環境是 GUI 執行緒的事件迴圈在收）
+    direct = Qt.ConnectionType.DirectConnection
+    ctrl.fatal_error.connect(fatals.append, direct)
+    ctrl.state_changed.connect(lambda s, m: states.append((s, m)), direct)
+
+    ctrl.start()
+    ctrl._queue.put(np.zeros(16000, dtype=np.float32))
+    deadline = time.monotonic() + 5.0
+    while time.monotonic() < deadline:
+        if any(state == "error" for state, _ in states):
+            break
+        time.sleep(0.02)
+    ctrl.stop()
+
+    assert fatals == [], "暫時性錯誤不該觸發致命錯誤（會自動關閉功能）"
+    assert any(state == "error" and "boom" in msg for state, msg in states)
+    assert ctrl._worker is None
+
+
+class _LateReadyStt:
+    """模擬語音模型還在載入：0.3 秒後才就緒。"""
+
+    def __init__(self, delay=0.3):
+        self._ready_at = time.monotonic() + delay
+
+    @property
+    def is_ready(self):
+        return time.monotonic() >= self._ready_at
+
+    def transcribe(self, audio, language="zh"):
+        assert self.is_ready, "模型還沒載入完就去辨識了"
+        return "hello world"
+
+
+def test_waits_for_stt_ready(tmp_path):
+    """開機就按熱鍵時語音模型還在載入：要等它好，不能直接報錯關掉功能。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl.stt = _LateReadyStt(0.3)
+    ctrl._running = True
+    states, captions, fatals = [], [], []
+    ctrl.state_changed.connect(lambda s, m: states.append((s, m)))
+    ctrl.caption_ready.connect(lambda a, b: captions.append((a, b)))
+    ctrl.fatal_error.connect(fatals.append)
+
+    started = time.monotonic()
+    ctrl._process(np.zeros(16000, dtype=np.float32), ctrl._generation)
+
+    assert time.monotonic() - started >= 0.25
+    assert states and states[0][0] == "loading"
+    assert captions == [("hello world", "你好世界")]
+    assert fatals == []

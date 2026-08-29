@@ -235,8 +235,10 @@ class MainWindow(FluentWindow):
         self.system_subtitle = SystemSubtitleOverlay(config)
         self.system_captions.caption_ready.connect(self._on_system_caption)
         self.system_captions.state_changed.connect(self.home.set_state)
+        # 暫時性錯誤只提示，功能繼續開著；致命錯誤才連同功能一起關掉
         self.system_captions.error_occurred.connect(self._show_error)
-        self.system_captions.error_occurred.connect(
+        self.system_captions.fatal_error.connect(self._show_error)
+        self.system_captions.fatal_error.connect(
             lambda _msg: self.set_system_captions_enabled(False))
         self.system_subtitle.closed_by_user.connect(
             lambda: self.set_system_captions_enabled(False))
@@ -278,6 +280,8 @@ class MainWindow(FluentWindow):
             self.set_system_captions_enabled)
         self.settings.system_captions_settings_changed.connect(
             self._apply_system_caption_style)
+        self.settings.system_captions_pipeline_changed.connect(
+            self._on_system_pipeline_changed)
 
     def _on_hotkey_changed(self):
         self.controller.apply_hotkey()
@@ -316,6 +320,8 @@ class MainWindow(FluentWindow):
             self.config.get("float_input", "enabled", default=False))
         self.subtitle.refresh_style()
         self._apply_overlay_opacity()
+        self.set_system_captions_enabled(
+            self.config.get("system_captions", "enabled", default=False))
         model = self.config.get("stt", "model_size", default="large-v3")
         if model != c.stt.model_size:
             c.reload_model(model)
@@ -374,6 +380,13 @@ class MainWindow(FluentWindow):
     def _apply_system_caption_style(self):
         self.system_subtitle.apply_style()
         self.system_subtitle.apply_opacity()
+
+    def _on_system_pipeline_changed(self):
+        """擷取裝置／翻譯引擎／運算裝置改了：這些只在 start() 時讀取，
+        正在跑的話要重啟才會生效。"""
+        if self.system_captions.is_running:
+            self.system_captions.stop()
+            self.system_captions.start()
 
     def _toggle_system_captions(self):
         self.set_system_captions_enabled(

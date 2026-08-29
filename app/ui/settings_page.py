@@ -135,6 +135,7 @@ class SettingsInterface(ScrollArea):
     languages_changed = Signal()
     system_captions_toggled = Signal(bool)
     system_captions_settings_changed = Signal()
+    system_captions_pipeline_changed = Signal()  # 只有需要重啟擷取的設定才發
 
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
@@ -736,19 +737,34 @@ class SettingsInterface(ScrollArea):
         self.config.set("grammar", "enabled", checked)
         self.hotkey_changed.emit()  # 讓主視窗重新套用熱鍵監聽
 
-    def _existing_hotkeys(self):
-        return {
-            (self.config.get("hotkey", "type", default="keyboard"),
-             self.config.get("hotkey", "key", default="f9")),
-            (self.config.get("replay_hotkey", "type", default="keyboard"),
-             self.config.get("replay_hotkey", "key", default="")),
-        }
+    # 各熱鍵在 config 裡的 (區段, 型別鍵, 按鍵鍵, 預設按鍵)
+    _HOTKEY_SLOTS = (
+        ("hotkey", "type", "key", "f9"),
+        ("replay_hotkey", "type", "key", ""),
+        ("grammar", "hotkey_type", "hotkey_key", "f10"),
+        ("system_captions", "hotkey_type", "hotkey_key", "f11"),
+    )
+
+    def _existing_hotkeys(self, exclude=None):
+        """目前已被占用的熱鍵。exclude 是要排除的區段名——
+        重新設定同一個熱鍵時，不該跟自己現在的設定判定為衝突。"""
+        taken = set()
+        for section, type_key, key_key, default in self._HOTKEY_SLOTS:
+            if section == exclude:
+                continue
+            key = self.config.get(section, key_key, default=default)
+            if not key:
+                continue
+            taken.add(
+                (self.config.get(section, type_key, default="keyboard"), key))
+        return taken
 
     def _on_grammar_hotkey_button(self):
         self.hotkey_capture_started.emit()
         dialog = HotkeyCaptureDialog(self.window())
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            if (dialog.result_type, dialog.result_key) in self._existing_hotkeys():
+            taken = self._existing_hotkeys(exclude="grammar")
+            if (dialog.result_type, dialog.result_key) in taken:
                 self.error_requested.emit("文法檢查熱鍵不能跟其他熱鍵相同")
             else:
                 self.config.set("grammar", "hotkey_type", dialog.result_type)
@@ -787,6 +803,9 @@ class SettingsInterface(ScrollArea):
         if self._loading:
             return
         sc = "system_captions"
+        before = (self.config.get(sc, "device", default="default"),
+                  self.config.get(sc, "engine", default="nllb-600m"),
+                  self.config.get(sc, "compute_device", default="auto"))
         index = self.system_device_combo.currentIndex()
         self.config.set(sc, "device", "default" if index == 0
                         else self.system_device_combo.currentText())
@@ -801,14 +820,18 @@ class SettingsInterface(ScrollArea):
         self.config.set(sc, "font_size", self.system_font_spin.value())
         self.config.set(sc, "opacity", self.system_opacity_spin.value())
         self.system_captions_settings_changed.emit()
+        after = (self.config.get(sc, "device", default="default"),
+                 self.config.get(sc, "engine", default="nllb-600m"),
+                 self.config.get(sc, "compute_device", default="auto"))
+        if after != before:
+            # 這三項只在 start() 時讀取，正在跑的話得重啟才會生效
+            self.system_captions_pipeline_changed.emit()
 
     def _on_system_hotkey_button(self):
         self.hotkey_capture_started.emit()
         dialog = HotkeyCaptureDialog(self.window())
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            taken = self._existing_hotkeys() | {
-                (self.config.get("grammar", "hotkey_type", default="keyboard"),
-                 self.config.get("grammar", "hotkey_key", default="f10"))}
+            taken = self._existing_hotkeys(exclude="system_captions")
             if (dialog.result_type, dialog.result_key) in taken:
                 self.error_requested.emit("系統字幕熱鍵不能跟其他熱鍵相同")
             else:
