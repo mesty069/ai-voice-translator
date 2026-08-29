@@ -120,7 +120,8 @@ class SystemAudioCapture:
         self._running = False
         thread, self._thread = self._thread, None
         if thread is not None:
-            thread.join(timeout=2.0)
+            # 讀取區塊只有 0.1 秒，稍等即可收屍；等太久會卡住呼叫端的 GUI 執行緒
+            thread.join(timeout=0.2)
 
     def _resolve_speaker(self):
         import soundcard as sc
@@ -149,6 +150,10 @@ class SystemAudioCapture:
                     for segment in self._acc.push(frames):
                         if self._on_segment is not None:
                             self._on_segment(segment)
+            # 正常停止：把最後一句還沒遇到停頓的尾段補送出去
+            tail = self._acc.drain()
+            if tail is not None and self._on_segment is not None:
+                self._on_segment(tail)
         except Exception as e:
             self._running = False
             if self._on_error is not None:

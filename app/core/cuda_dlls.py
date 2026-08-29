@@ -21,6 +21,10 @@ def register_cuda_dll_dirs():
     for nvidia_dir in roots:
         if nvidia_dir.is_dir():
             bin_dirs.extend(str(p) for p in nvidia_dir.glob("*/bin"))
-    if bin_dirs:
-        os.environ["PATH"] = (
-            os.pathsep.join(bin_dirs) + os.pathsep + os.environ.get("PATH", ""))
+    # 這個函式會被 STT 與翻譯兩條路徑各呼叫多次，重複加會把 PATH 撐爆，
+    # 已經在裡面的目錄就跳過
+    current = os.environ.get("PATH", "")
+    existing = {p for p in current.split(os.pathsep) if p}
+    new_dirs = [d for d in bin_dirs if d not in existing]
+    if new_dirs:
+        os.environ["PATH"] = os.pathsep.join(new_dirs) + os.pathsep + current

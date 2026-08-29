@@ -159,8 +159,6 @@ def push_away(mover, fixed, bounds, margin: int = 12):
     mover / fixed / bounds 都是 QRect；回傳新的左上角 QPoint。
     不重疊就原樣回傳。優先往移動距離較短、且放得下的方向讓開。
     """
-    from PySide6.QtCore import QPoint, QRect
-
     padded = fixed.adjusted(-margin, -margin, margin, margin)
     if not mover.intersects(padded):
         return mover.topLeft()

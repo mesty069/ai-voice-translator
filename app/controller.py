@@ -127,7 +127,6 @@ class AppController(QObject):
             self.error_occurred.emit(str(e))
 
     def apply_system_hotkey(self):
-        enabled = self.config.get("system_captions", "enabled", default=False)
         hotkey_type = self.config.get(
             "system_captions", "hotkey_type", default="keyboard")
         key_name = self.config.get(

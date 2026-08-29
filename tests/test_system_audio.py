@@ -85,3 +85,61 @@ def test_pure_silence_segment_is_discarded_on_force_cut():
     """整段都是數位靜音時，即使觸發強制切段也不該送出。"""
     acc = SegmentAccumulator(silence_ms=600, max_seconds=2.0, min_seconds=0.5)
     assert _feed(acc, _silence(6.0)) == []
+
+
+class _FakeRecorder:
+    """假的 loopback 錄音器：固定吐出語音，吐滿指定塊數後讓擷取停止。"""
+
+    def __init__(self, capture, blocks):
+        self._capture = capture
+        self._blocks = blocks
+        self._sent = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+    def record(self, numframes):
+        self._sent += 1
+        if self._sent >= self._blocks:
+            self._capture._running = False   # 模擬使用者按下停止
+        return _speech(numframes / SAMPLE_RATE)
+
+
+class _FakeSpeaker:
+    name = "假喇叭"
+
+
+class _FakeSoundcard:
+    def __init__(self, capture, blocks):
+        self._capture = capture
+        self._blocks = blocks
+
+    def default_speaker(self):
+        return _FakeSpeaker()
+
+    def all_speakers(self):
+        return [_FakeSpeaker()]
+
+    def get_microphone(self, name, include_loopback=False):
+        recorder = _FakeRecorder(self._capture, self._blocks)
+        return type("Mic", (), {"recorder": lambda _s, **kw: recorder})()
+
+
+def test_stop_flushes_pending_tail(monkeypatch):
+    """停止擷取時，最後一句還沒遇到停頓的尾段也要送出，不能整句吞掉。"""
+    from app.core import system_audio
+
+    segments = []
+    capture = system_audio.SystemAudioCapture(on_segment=segments.append)
+    # 10 塊 × 0.1 秒 ＝ 1 秒語音：不到 max_seconds、也沒有停頓，
+    # 所以整段只會停在緩衝裡，唯有停止時的 drain 才會送出
+    monkeypatch.setitem(sys.modules, "soundcard",
+                        _FakeSoundcard(capture, blocks=10))
+    capture.start()
+    capture._thread.join(timeout=5.0)
+
+    assert len(segments) == 1, "停止時未送出尾段"
+    assert len(segments[0]) >= int(SAMPLE_RATE * 0.8)
