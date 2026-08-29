@@ -703,9 +703,13 @@ class SettingsInterface(ScrollArea):
         self.hotkey_capture_started.emit()
         dialog = HotkeyCaptureDialog(self.window())
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            self.config.set("hotkey", "type", dialog.result_type)
-            self.config.set("hotkey", "key", dialog.result_key)
-            self._refresh_hotkey_button()
+            taken = self._existing_hotkeys(exclude="hotkey")
+            if (dialog.result_type, dialog.result_key) in taken:
+                self.error_requested.emit("錄音熱鍵不能跟其他熱鍵相同")
+            else:
+                self.config.set("hotkey", "type", dialog.result_type)
+                self.config.set("hotkey", "key", dialog.result_key)
+                self._refresh_hotkey_button()
         # 取消也要 emit：讓主視窗重新掛回熱鍵監聽
         self.hotkey_changed.emit()
 
@@ -713,13 +717,9 @@ class SettingsInterface(ScrollArea):
         self.hotkey_capture_started.emit()
         dialog = HotkeyCaptureDialog(self.window())
         if dialog.exec() == QDialog.DialogCode.Accepted:
-            same_as_main = (
-                dialog.result_type == self.config.get(
-                    "hotkey", "type", default="keyboard")
-                and dialog.result_key == self.config.get(
-                    "hotkey", "key", default="f9"))
-            if same_as_main:
-                self.error_requested.emit("朗讀熱鍵不能跟錄音熱鍵相同")
+            taken = self._existing_hotkeys(exclude="replay_hotkey")
+            if (dialog.result_type, dialog.result_key) in taken:
+                self.error_requested.emit("朗讀熱鍵不能跟其他熱鍵相同")
             else:
                 self.config.set("replay_hotkey", "type", dialog.result_type)
                 self.config.set("replay_hotkey", "key", dialog.result_key)
