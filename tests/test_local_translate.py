@@ -13,6 +13,7 @@ from app.core.local_translate import (
     NLLB_CODES,
     LocalTranslator,
     repo_for,
+    split_sentences,
 )
 
 
@@ -238,3 +239,128 @@ def test_translate_reloads_when_model_is_unloaded_mid_call(monkeypatch, tmp_path
     translator.is_ready = racy_is_ready
     assert translator.translate("hello", "en", "zh") == "翻譯結果"
     assert len(downloads) == 2, "模型被清掉後應重新載入一次"
+
+
+# ---- split_sentences（F7：NLLB/OPUS-MT 是句子級模型，多句常常漏句） ----
+
+def test_split_sentences_multi_sentence_english():
+    text = ("Let's review it again. First, let's look at the ingredients "
+            "in the source. The next key step is...")
+    assert split_sentences(text) == [
+        "Let's review it again.",
+        "First, let's look at the ingredients in the source.",
+        "The next key step is...",
+    ]
+
+
+def test_split_sentences_does_not_split_decimal_point():
+    assert split_sentences("Version 3.5 is out. Great.") == [
+        "Version 3.5 is out.",
+        "Great.",
+    ]
+
+
+def test_split_sentences_ellipsis_is_single_terminator():
+    assert split_sentences("Wait... what?") == ["Wait...", "what?"]
+
+
+def test_split_sentences_cjk_terminators():
+    assert split_sentences("你好。再見！") == ["你好。", "再見！"]
+
+
+def test_split_sentences_single_sentence():
+    assert split_sentences("Hello there") == ["Hello there"]
+    assert split_sentences("Hello there.") == ["Hello there."]
+
+
+def test_split_sentences_empty_input():
+    assert split_sentences("") == []
+    assert split_sentences(None) == []
+
+
+def test_translate_batches_all_sentences_in_one_call(monkeypatch, tmp_path):
+    """多句輸入要一次呼叫 translate_batch 把所有句子一起送進去，
+    不能逐句各自呼叫（那樣就失去意義，而且更慢）。target=zh 時句子間
+    直接串接，不加空白。"""
+    from app.core import local_translate as lt
+
+    class FakeTokenizer:
+        def encode(self, text):
+            return [len(text)]
+
+        def convert_ids_to_tokens(self, ids):
+            return [str(i) for i in ids]
+
+        def convert_tokens_to_ids(self, tokens):
+            return [int(t) for t in tokens]
+
+        def decode(self, ids, skip_special_tokens=True):
+            return f"譯[{ids[0]}]"
+
+    class FakeResult:
+        def __init__(self, tag):
+            self.hypotheses = [["lang", tag]]
+
+    captured = {}
+
+    class FakeTranslator:
+        def translate_batch(self, sources, **kwargs):
+            captured["sources"] = sources
+            captured["kwargs"] = kwargs
+            return [FakeResult(src[-1]) for src in sources]
+
+    monkeypatch.setattr(lt, "_snapshot_download", lambda repo: str(tmp_path))
+    monkeypatch.setattr(lt, "_load_tokenizer",
+                        lambda path, **kwargs: FakeTokenizer())
+    monkeypatch.setattr(lt, "_make_translator",
+                        lambda path, device, compute_type: FakeTranslator())
+
+    translator = lt.LocalTranslator(compute_device="cpu")
+    text = "One. Two. Three."  # 三句：len 各為 4, 4, 6
+    result = translator.translate(text, "en", "zh")
+
+    assert len(captured["sources"]) == 3, "三句要在同一次 translate_batch 送出"
+    assert captured["kwargs"]["target_prefix"] == [["zho_Hans"]] * 3
+    assert result == "譯[4]譯[4]譯[6]"
+
+
+def test_translate_joins_non_cjk_target_with_space(monkeypatch, tmp_path):
+    """目標語言不是中日韓時，句子之間要用空白接回去。"""
+    from app.core import local_translate as lt
+
+    class FakeTokenizer:
+        def encode(self, text):
+            return [len(text)]
+
+        def convert_ids_to_tokens(self, ids):
+            return [str(i) for i in ids]
+
+        def convert_tokens_to_ids(self, tokens):
+            return [int(t) for t in tokens]
+
+        def decode(self, ids, skip_special_tokens=True):
+            return f"tr{ids[0]}"
+
+    class FakeResult:
+        def __init__(self, tag):
+            self.hypotheses = [tag]  # opus：不去掉語言標記那個 slice
+
+    captured = {}
+
+    class FakeTranslator:
+        def translate_batch(self, sources, **kwargs):
+            captured["sources"] = sources
+            return [FakeResult(src) for src in sources]
+
+    monkeypatch.setattr(lt, "_snapshot_download", lambda repo: str(tmp_path))
+    monkeypatch.setattr(lt, "_load_tokenizer",
+                        lambda path, **kwargs: FakeTokenizer())
+    monkeypatch.setattr(lt, "_make_translator",
+                        lambda path, device, compute_type: FakeTranslator())
+
+    translator = lt.LocalTranslator(engine="opus-mt", compute_device="cpu")
+    result = translator.translate("Hi there. Bye now.", "en", "fr")
+
+    # "Hi there." 長度 9、"Bye now." 長度 8 → FakeTokenizer 以長度當 id
+    assert len(captured["sources"]) == 2
+    assert result == "tr9 tr8"

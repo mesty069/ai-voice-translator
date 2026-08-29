@@ -70,6 +70,92 @@ def postprocess(text: str, tgt: str) -> str:
     return text
 
 
+_ELLIPSIS_CHAR = "…"
+_SENTENCE_TERMINATORS = ".!?"
+_CJK_TERMINATORS = "。！？"
+
+
+def split_sentences(text: str) -> list:
+    """把文字切成一句一句。
+
+    NLLB/OPUS-MT 是句子級模型：多句一次餵進去常常只吐出其中一句
+    （實測混進去的長輸入只譯出中間那一句），所以要先切句、逐句翻譯，
+    再把結果串回去。
+
+    規則刻意保守（keep it simple）：
+    - 「...」（3 個以上的點）或「…」視為單一終止符號：只要後面接空白
+      或已到字串結尾就切，不論下一個字的大小寫——刪節號本身就是夠強
+      的句界訊號（例：「Wait... what?」要切成「Wait...」「what?」）。
+    - 「. ! ?」後面要接空白，且再往後第一個非空白字元是大寫字母、或
+      已到字串結尾，才切——避免切在「3.5」這種小數點，或「Mr. smith」
+      這種縮寫後接小寫字母的情況。
+    - 中日韓句號「。！？」不需要接空白就直接切（CJK 原本就不加空白）。
+    """
+    if not text:
+        return []
+    n = len(text)
+    pieces = []
+    start = 0
+    i = 0
+    while i < n:
+        ch = text[i]
+        if ch == _ELLIPSIS_CHAR or (ch == "." and text[i:i + 3] == "..."):
+            if ch == _ELLIPSIS_CHAR:
+                j = i + 1
+            else:
+                j = i
+                while j < n and text[j] == ".":
+                    j += 1
+            rest = text[j:]
+            if rest == "" or rest[0].isspace():
+                piece = text[start:j].strip()
+                if piece:
+                    pieces.append(piece)
+                k = j
+                while k < n and text[k].isspace():
+                    k += 1
+                start = k
+                i = k
+                continue
+            i = j
+            continue
+        if ch in _CJK_TERMINATORS:
+            j = i + 1
+            piece = text[start:j].strip()
+            if piece:
+                pieces.append(piece)
+            start = j
+            i = j
+            continue
+        if ch in _SENTENCE_TERMINATORS:
+            j = i + 1
+            rest = text[j:]
+            if rest == "":
+                piece = text[start:j].strip()
+                if piece:
+                    pieces.append(piece)
+                start = j
+                i = j
+                continue
+            if rest[0].isspace():
+                k = j
+                while k < n and text[k].isspace():
+                    k += 1
+                if k >= n or text[k].isupper():
+                    piece = text[start:j].strip()
+                    if piece:
+                        pieces.append(piece)
+                    start = k
+                    i = k
+                    continue
+        i += 1
+    if start < n:
+        piece = text[start:].strip()
+        if piece:
+            pieces.append(piece)
+    return pieces
+
+
 def repo_for(engine: str, src: str, tgt: str):
     """回傳 (repo_id, kind)。engine 不存在時丟 KeyError。"""
     spec = ENGINES[engine]
@@ -145,18 +231,26 @@ class LocalTranslator:
         return [("cuda", "int8_float16"), ("cpu", "int8")]
 
     @staticmethod
-    def _run_batch(translator, tokenizer, kind, text, tgt) -> str:
-        source = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+    def _run_batch(translator, tokenizer, kind, texts, tgt) -> list:
+        """texts 是一份句子清單，一次呼叫 translate_batch 全部翻完——
+        NLLB/OPUS-MT 是句子級模型，逐句分開呼叫沒問題，但多句塞進同一句
+        反而常常漏句，所以呼叫端要先用 split_sentences 切開。"""
+        sources = [tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+                   for text in texts]
         if kind == "nllb":
             results = translator.translate_batch(
-                [source], target_prefix=[[NLLB_CODES[tgt]]], beam_size=2)
-            hypothesis = results[0].hypotheses[0][1:]  # 去掉語言標記
+                sources, target_prefix=[[NLLB_CODES[tgt]]] * len(sources),
+                beam_size=2)
+            hypotheses = [r.hypotheses[0][1:] for r in results]  # 去掉語言標記
         else:
-            results = translator.translate_batch([source], beam_size=2)
-            hypothesis = results[0].hypotheses[0]
-        ids = tokenizer.convert_tokens_to_ids(hypothesis)
-        decoded = tokenizer.decode(ids, skip_special_tokens=True).strip()
-        return postprocess(decoded, tgt)
+            results = translator.translate_batch(sources, beam_size=2)
+            hypotheses = [r.hypotheses[0] for r in results]
+        outputs = []
+        for hypothesis in hypotheses:
+            ids = tokenizer.convert_tokens_to_ids(hypothesis)
+            decoded = tokenizer.decode(ids, skip_special_tokens=True).strip()
+            outputs.append(postprocess(decoded, tgt))
+        return outputs
 
     def ensure_loaded(self, src: str, tgt: str, progress_cb=None):
         """載入（必要時下載）模型。
@@ -191,7 +285,7 @@ class LocalTranslator:
                     candidate = _make_translator(path, device, compute_type)
                     # CTranslate2 的 CUDA 函式庫是延遲載入：建構成功不代表能用，
                     # 必須真的跑一次推論才會暴露缺 DLL 的錯誤，否則永遠不會退回 CPU
-                    self._run_batch(candidate, tokenizer, kind, "test", tgt)
+                    self._run_batch(candidate, tokenizer, kind, ["test"], tgt)
                     translator, used_device = candidate, device
                     break
                 except Exception as e:
@@ -217,6 +311,11 @@ class LocalTranslator:
         text = (text or "").strip()
         if not text:
             return ""
+        # NLLB/OPUS-MT 是句子級模型：多句一次餵進去常常漏句，所以先切句、
+        # 全部句子一次進 _run_batch（一次 translate_batch 呼叫），再串回去
+        sentences = split_sentences(text)
+        if not sentences:
+            return ""
         # ensure_loaded 回來後到取鎖之間，set_engine 可能已經 _unload()，
         # 所以推論前要在鎖內再確認一次；沒就緒就重載（最多兩輪）
         for _ in range(2):
@@ -224,6 +323,8 @@ class LocalTranslator:
             with self._lock:
                 if not self.is_ready(src, tgt):
                     continue
-                return self._run_batch(self._translator, self._tokenizer,
-                                       self._kind, text, tgt)
+                outputs = self._run_batch(self._translator, self._tokenizer,
+                                          self._kind, sentences, tgt)
+                sep = "" if tgt in ("zh", "ja", "ko") else " "
+                return sep.join(outputs)
         raise RuntimeError("翻譯設定變更過於頻繁，本段跳過")
