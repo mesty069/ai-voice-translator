@@ -55,6 +55,21 @@ def test_set_engine_invalidates_loaded_model():
     assert not translator.is_ready("en", "zh")
 
 
+def test_chinese_uses_simplified_nllb_code():
+    # 見 local_translate.py 註解：繁體代碼會系統性截斷，故以簡體解碼再轉繁
+    assert NLLB_CODES["zh"] == "zho_Hans"
+
+
+def test_postprocess_converts_to_taiwan_traditional():
+    from app.core.local_translate import postprocess
+    assert postprocess("服务器在凌晨3点下降了", "zh") == "伺服器在凌晨3點下降了"
+
+
+def test_postprocess_leaves_other_languages_untouched():
+    from app.core.local_translate import postprocess
+    assert postprocess("The server went down.", "en") == "The server went down."
+
+
 def test_falls_back_to_cpu_when_cuda_fails_at_inference(monkeypatch, tmp_path):
     """CTranslate2 的 CUDA 錯誤是延遲發生的：建構成功、推論才失敗，
     所以只包住建構子的 try/except 永遠不會退回 CPU。"""

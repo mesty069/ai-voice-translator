@@ -18,3 +18,5 @@ soundcard
 # 本機翻譯用的 tokenizer（不會安裝 torch）
 transformers
 sentencepiece
+# 簡體→台灣繁體（NLLB 以簡體解碼品質才完整，見 local_translate.py）
+opencc-python-reimplemented

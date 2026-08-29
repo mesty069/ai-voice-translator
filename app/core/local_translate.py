@@ -3,8 +3,11 @@ import threading
 from .cuda_dlls import register_cuda_dll_dirs
 
 # 程式的語言代碼 → NLLB-200 的語言代碼
+# 中文刻意用簡體 zho_Hans 解碼再以 OpenCC 轉台灣繁體：NLLB 的繁體訓練資料
+# 遠少於簡體，直接用 zho_Hant 會系統性地在逗號後截斷（實測 6 句中 3 句），
+# 換 zho_Hans 全部完整。
 NLLB_CODES = {
-    "zh": "zho_Hant",
+    "zh": "zho_Hans",
     "en": "eng_Latn",
     "ja": "jpn_Jpan",
     "ko": "kor_Hang",
@@ -37,6 +40,25 @@ ENGINE_LABELS = [
     ("nllb-1.3b", "NLLB 1.3B（約 1.3GB，品質最好、較慢）"),
     ("opus-mt", "OPUS-MT（約 80MB，單一語言對、最快）"),
 ]
+
+
+_opencc = None
+
+
+def to_traditional(text: str) -> str:
+    """簡體 → 台灣繁體（含用語轉換，如 服务器→伺服器）。"""
+    global _opencc
+    if _opencc is None:
+        from opencc import OpenCC
+        _opencc = OpenCC("s2twp")
+    return _opencc.convert(text)
+
+
+def postprocess(text: str, tgt: str) -> str:
+    """翻譯結果的後處理：目標為中文時轉成台灣繁體。"""
+    if tgt == "zh":
+        return to_traditional(text)
+    return text
 
 
 def repo_for(engine: str, src: str, tgt: str):
@@ -118,7 +140,8 @@ class LocalTranslator:
             results = translator.translate_batch([source], beam_size=2)
             hypothesis = results[0].hypotheses[0]
         ids = tokenizer.convert_tokens_to_ids(hypothesis)
-        return tokenizer.decode(ids, skip_special_tokens=True).strip()
+        decoded = tokenizer.decode(ids, skip_special_tokens=True).strip()
+        return postprocess(decoded, tgt)
 
     def ensure_loaded(self, src: str, tgt: str, progress_cb=None):
         with self._lock:
