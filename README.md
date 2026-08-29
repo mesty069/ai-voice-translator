@@ -62,6 +62,15 @@ python -m venv .venv
 - 播放為單一通道：新的朗讀（含 🔊 重播、朗讀熱鍵）會**打斷並取代**正在播的。
 - **朗讀熱鍵**（選配）：字幕顯示時按了重播；字幕消失後無效。
 
+### 系統聲音字幕（聽電腦在播什麼）
+- 設定頁「系統聲音字幕」開啟（或按 F11、懸浮球長按選單）後，程式會擷取
+  **電腦正在播放的聲音**（YouTube、線上會議…，不含你的麥克風），
+  即時辨識並用**本機模型**翻成母語，以青藍色雙語字幕顯示在畫面上方。
+- 翻譯不走 DeepSeek，模型可在設定頁切換（NLLB 600M / 1.3B / OPUS-MT），
+  首次使用會自動下載，之後離線可用。
+- 字幕可拖動、調大小、調透明度；與麥克風字幕重疊時會自動推開。
+- 「歷史」按鈕可展開本次的整段逐字稿並複製。
+
 ## 架構重點
 
 - AI 供應商採**策略模式 + 工廠**（`app/ai/`）：`TranslationProvider` 介面 +
@@ -78,6 +87,10 @@ python -m venv .venv
 - TTS 可打斷（`app/core/tts.py`）：序號機制，後來的請求作廢/覆蓋前面的播放；
   在獨立執行緒執行，不占用翻譯流程的工作佇列。
 - 設計文件：`docs/superpowers/specs/2026-08-21-voice-translator-design.md`
+- 系統聲音擷取（`app/core/system_audio.py`）：PortAudio 沒有 loopback 裝置，
+  改用 `soundcard` 的 WASAPI loopback；能量門檻切句後才送辨識。
+- 本機翻譯（`app/core/local_translate.py`）：直接用 faster-whisper 已安裝的 CTranslate2 跑 NLLB/OPUS-MT，刻意避開 Argos Translate
+  （會引入 torch+spacy+stanza 約 2–3GB）。
 
 ## 測試
 
