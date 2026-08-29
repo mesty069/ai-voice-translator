@@ -102,6 +102,28 @@ def test_normalize_cjk_punct_is_idempotent():
     assert normalize_cjk_punct("你好。世界") == "你好。世界"
 
 
+# ---- F9：標點連續出現時要整串跳過，不能只轉第一個字元 ----
+
+def test_normalize_cjk_punct_leaves_ellipsis_run_untouched():
+    assert normalize_cjk_punct("是...") == "是..."
+
+
+def test_normalize_cjk_punct_leaves_double_exclamation_untouched():
+    assert normalize_cjk_punct("好!!") == "好!!"
+
+
+def test_normalize_cjk_punct_leaves_mixed_punct_run_untouched():
+    assert normalize_cjk_punct("好?!") == "好?!"
+
+
+def test_normalize_cjk_punct_leaves_fullwidth_ellipsis_untouched():
+    assert normalize_cjk_punct("好…") == "好…"
+
+
+def test_normalize_cjk_punct_still_converts_single_terminator_before_run():
+    assert normalize_cjk_punct("好. 下一句") == "好。下一句"
+
+
 def test_normalize_cjk_punct_english_target_unchanged_via_postprocess():
     from app.core.local_translate import postprocess
     text = "Hello, world. Nice to meet you."
