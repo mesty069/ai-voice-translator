@@ -30,10 +30,13 @@ from qfluentwidgets import (
 
 from ..config import Config
 from ..controller import AppController
+from ..core.system_captions import SystemCaptionsController
 from .bubble import BubbleWidget
 from .float_input import EnterSubmitFilter, FloatingInputWidget
+from .overlay_base import push_away
 from .settings_page import SettingsInterface
 from .subtitle import SubtitleOverlay
+from .system_subtitle import SystemSubtitleOverlay
 from .wait_hint import WaitHintOverlay
 
 STATE_COLORS = {
@@ -227,6 +230,20 @@ class MainWindow(FluentWindow):
             lambda: self.set_float_input_enabled(False))
         self.bubble.input_toggle_requested.connect(self._toggle_float_input)
 
+        self.system_captions = SystemCaptionsController(
+            config, controller.stt, controller.mic_busy, self)
+        self.system_subtitle = SystemSubtitleOverlay(config)
+        self.system_captions.caption_ready.connect(self._on_system_caption)
+        self.system_captions.state_changed.connect(self.home.set_state)
+        self.system_captions.error_occurred.connect(self._show_error)
+        self.system_captions.error_occurred.connect(
+            lambda _msg: self.set_system_captions_enabled(False))
+        self.system_subtitle.closed_by_user.connect(
+            lambda: self.set_system_captions_enabled(False))
+        self.bubble.system_captions_toggle_requested.connect(
+            self._toggle_system_captions)
+        controller.system_hotkey_pressed.connect(self._toggle_system_captions)
+
         controller.state_changed.connect(self.home.set_state)
         controller.state_changed.connect(
             lambda state, _msg: self.bubble.set_state(state))
@@ -245,6 +262,7 @@ class MainWindow(FluentWindow):
         self.settings.hotkey_capture_started.connect(controller.hotkey.stop)
         self.settings.hotkey_capture_started.connect(controller.replay_hotkey.stop)
         self.settings.hotkey_capture_started.connect(controller.grammar_hotkey.stop)
+        self.settings.hotkey_capture_started.connect(controller.system_hotkey.stop)
         self.settings.error_requested.connect(self._show_error)
         self.settings.settings_reset.connect(self._on_settings_reset)
         self.settings.languages_changed.connect(self.home.refresh_hint)
@@ -256,11 +274,16 @@ class MainWindow(FluentWindow):
         self.settings.float_input_toggled.connect(self.set_float_input_enabled)
         self.settings.overlay_opacity_changed.connect(self._apply_overlay_opacity)
         self.settings.subtitle_style_changed.connect(self.subtitle.refresh_style)
+        self.settings.system_captions_toggled.connect(
+            self.set_system_captions_enabled)
+        self.settings.system_captions_settings_changed.connect(
+            self._apply_system_caption_style)
 
     def _on_hotkey_changed(self):
         self.controller.apply_hotkey()
         self.controller.apply_replay_hotkey()
         self.controller.apply_grammar_hotkey()
+        self.controller.apply_system_hotkey()
         self.home.refresh_hint()
 
     def _on_app_state_changed(self, state):
@@ -286,6 +309,7 @@ class MainWindow(FluentWindow):
         c.apply_hotkey()
         c.apply_replay_hotkey()
         c.apply_grammar_hotkey()
+        c.apply_system_hotkey()
         c.apply_recording_device()
         self.home.refresh_hint()
         self.set_float_input_enabled(
@@ -347,6 +371,46 @@ class MainWindow(FluentWindow):
         else:
             self.float_input.hide()
 
+    def _apply_system_caption_style(self):
+        self.system_subtitle.apply_style()
+        self.system_subtitle.apply_opacity()
+
+    def _toggle_system_captions(self):
+        self.set_system_captions_enabled(
+            not self.config.get("system_captions", "enabled", default=False))
+
+    def set_system_captions_enabled(self, enabled: bool):
+        """熱鍵、設定頁開關、字幕 ✕ 三處共用的同一個狀態。"""
+        self.config.set("system_captions", "enabled", enabled)
+        self.settings.set_system_captions_checked(enabled)
+        if enabled:
+            self.system_subtitle.clear_history()
+            self.system_subtitle.show_overlay(self._current_screen())
+            self._avoid_overlap(self.system_subtitle, self.subtitle)
+            self.system_captions.start()
+        else:
+            self.system_captions.stop()
+            self.system_subtitle.hide()
+
+    def _current_screen(self):
+        return self.screen() if self.isVisible() else self.bubble.screen()
+
+    def _on_system_caption(self, original: str, translated: str):
+        self.system_subtitle.update_caption(original, translated)
+        self._avoid_overlap(self.system_subtitle, self.subtitle)
+
+    def _avoid_overlap(self, mover, fixed):
+        """兩個字幕都在畫面上時，把 mover 推開到不重疊的位置。"""
+        if not mover.isVisible() or not fixed.isVisible():
+            return
+        screen = (QApplication.screenAt(mover.frameGeometry().center())
+                  or QApplication.primaryScreen())
+        target = push_away(mover.frameGeometry(), fixed.frameGeometry(),
+                           screen.availableGeometry())
+        if target != mover.pos():
+            mover.move(target)
+            mover.save_geometry()
+
     def _on_state_changed(self, state: str, message: str):
         # 翻譯流程結束（成功或失敗）→ 收掉等待旋轉圈
         if state in ("idle", "error"):
@@ -362,6 +426,7 @@ class MainWindow(FluentWindow):
         # 懸浮球模式下用字幕顯示結果
         if not self.isVisible():
             self.subtitle.show_result(refined, english, self.bubble.screen())
+            self._avoid_overlap(self.subtitle, self.system_subtitle)
 
     def _show_error(self, message: str):
         # 懸浮球模式 → 用字幕顯示
@@ -461,6 +526,8 @@ class MainWindow(FluentWindow):
         self._quitting = True
         self.subtitle.hide()
         self.float_input.hide()
+        self.system_captions.stop()
+        self.system_subtitle.hide()
         self.wait_hint.hide()
         self.bubble.hide()
         self.controller.shutdown()

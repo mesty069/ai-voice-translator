@@ -142,6 +142,7 @@ class BubbleMenu(QWidget):
     """長按懸浮球展開的功能選單。"""
 
     input_clicked = Signal()
+    system_captions_clicked = Signal()
     window_clicked = Signal()
     quit_clicked = Signal()
 
@@ -160,6 +161,7 @@ class BubbleMenu(QWidget):
             "QPushButton:hover { background: rgba(255,255,255,36); }")
         for text, signal in (
                 ("⌨  輸入框 開/關", self.input_clicked),
+                ("🔊  系統字幕 開/關", self.system_captions_clicked),
                 ("🗖  開啟主視窗", self.window_clicked),
                 ("✕  結束程式", self.quit_clicked)):
             btn = QPushButton(text, self)
@@ -237,6 +239,7 @@ class BubbleWidget(QWidget):
     clicked = Signal()
     close_requested = Signal()
     input_toggle_requested = Signal()
+    system_captions_toggle_requested = Signal()
 
     def __init__(self):
         super().__init__(None, _FLAGS)
@@ -245,6 +248,8 @@ class BubbleWidget(QWidget):
         self.setToolTip("點一下開啟視窗，長按展開選單，拖到下方 ✕ 關閉程式")
         self.menu = BubbleMenu()
         self.menu.input_clicked.connect(self.input_toggle_requested)
+        self.menu.system_captions_clicked.connect(
+            self.system_captions_toggle_requested)
         self.menu.window_clicked.connect(self.clicked)
         self.menu.quit_clicked.connect(self.close_requested)
         self._menu_shown_this_press = False

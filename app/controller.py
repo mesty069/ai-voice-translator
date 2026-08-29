@@ -44,6 +44,7 @@ class AppController(QObject):
     enter_pressed = Signal()                  # 全域 Enter（字幕顯示時進入編輯）
     tts_playing = Signal(bool)                # 朗讀開始/結束（字幕倒數依此暫停）
     wait_hint_visible = Signal(bool)          # 隔離空窗期（畫面中央「請稍等再說」）
+    system_hotkey_pressed = Signal()          # 系統字幕開關熱鍵
 
     def __init__(self, config: Config, parent=None):
         super().__init__(parent)
@@ -68,6 +69,8 @@ class AppController(QObject):
             self.replay_hotkey_pressed.emit, lambda: None)
         self.grammar_hotkey = HotkeyListener(
             self._on_grammar_press, self._on_hotkey_release)
+        self.system_hotkey = HotkeyListener(
+            self.system_hotkey_pressed.emit, lambda: None)
         self._mode = "translate"  # translate | grammar
         self.enter_listener = HotkeyListener(
             self.enter_pressed.emit, lambda: None)
@@ -85,6 +88,7 @@ class AppController(QObject):
         self.apply_hotkey()
         self.apply_replay_hotkey()
         self.apply_grammar_hotkey()
+        self.apply_system_hotkey()
         try:
             self.enter_listener.configure("keyboard", "enter")
         except ValueError:
@@ -95,6 +99,7 @@ class AppController(QObject):
         self.hotkey.stop()
         self.replay_hotkey.stop()
         self.grammar_hotkey.stop()
+        self.system_hotkey.stop()
         self.enter_listener.stop()
         self._executor.shutdown(wait=False)
 
@@ -120,6 +125,25 @@ class AppController(QObject):
             self.replay_hotkey.configure(hotkey_type, key_name)
         except ValueError as e:
             self.error_occurred.emit(str(e))
+
+    def apply_system_hotkey(self):
+        enabled = self.config.get("system_captions", "enabled", default=False)
+        hotkey_type = self.config.get(
+            "system_captions", "hotkey_type", default="keyboard")
+        key_name = self.config.get(
+            "system_captions", "hotkey_key", default="f11")
+        # 熱鍵永遠掛著（否則關掉後就沒辦法用熱鍵開回來）
+        if not key_name:
+            self.system_hotkey.stop()
+            return
+        try:
+            self.system_hotkey.configure(hotkey_type, key_name)
+        except ValueError as e:
+            self.error_occurred.emit(str(e))
+
+    def mic_busy(self) -> bool:
+        """麥克風正在錄音或處理中——系統字幕要讓路。"""
+        return self._session_active
 
     def _load_model(self):
         size = self.stt.model_size
