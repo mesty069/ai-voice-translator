@@ -1,30 +1,8 @@
-import os
 import threading
-from pathlib import Path
 
 import numpy as np
 
-
-def _register_cuda_dll_dirs():
-    """把 nvidia-cublas / nvidia-cudnn DLL 目錄加進 PATH，
-    讓 ctranslate2 的 CUDA 模式找得到 cublas64_12.dll / cudnn64_9.dll。
-    （os.add_dll_directory 對 ctranslate2 的動態 LoadLibrary 無效，實測
-    必須用 PATH。）開發環境找 site-packages；打包後找 _internal/nvidia。"""
-    import sys
-    roots = []
-    meipass = getattr(sys, "_MEIPASS", None)
-    if meipass:
-        roots.append(Path(meipass) / "nvidia")
-    else:
-        import site
-        roots.extend(Path(sp) / "nvidia" for sp in site.getsitepackages())
-    bin_dirs = []
-    for nvidia_dir in roots:
-        if nvidia_dir.is_dir():
-            bin_dirs.extend(str(p) for p in nvidia_dir.glob("*/bin"))
-    if bin_dirs:
-        os.environ["PATH"] = (
-            os.pathsep.join(bin_dirs) + os.pathsep + os.environ.get("PATH", ""))
+from .cuda_dlls import register_cuda_dll_dirs
 
 
 class SpeechToText:
@@ -53,7 +31,7 @@ class SpeechToText:
 
     def load(self):
         from faster_whisper import WhisperModel
-        _register_cuda_dll_dirs()
+        register_cuda_dll_dirs()
         restore_priority = self._lower_priority()
         try:
             with self._lock:

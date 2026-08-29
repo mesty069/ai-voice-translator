@@ -1,5 +1,7 @@
 import threading
 
+from .cuda_dlls import register_cuda_dll_dirs
+
 # 程式的語言代碼 → NLLB-200 的語言代碼
 NLLB_CODES = {
     "zh": "zho_Hant",
@@ -43,6 +45,23 @@ def repo_for(engine: str, src: str, tgt: str):
     return spec["repo"].format(src=src, tgt=tgt), spec["kind"]
 
 
+# 以下三個薄封裝讓 ensure_loaded 的載入流程可以被測試替換，
+# 不需要真的連網下載模型或有 GPU。
+def _snapshot_download(repo: str) -> str:
+    from huggingface_hub import snapshot_download
+    return snapshot_download(repo)
+
+
+def _load_tokenizer(path: str, **kwargs):
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(path, **kwargs)
+
+
+def _make_translator(path: str, device: str, compute_type: str):
+    import ctranslate2
+    return ctranslate2.Translator(path, device=device, compute_type=compute_type)
+
+
 class LocalTranslator:
     """CTranslate2 本機翻譯。模型首次使用才下載，之後快取在本機。
 
@@ -58,6 +77,7 @@ class LocalTranslator:
         self._translator = None
         self._tokenizer = None
         self._kind = None
+        self.device = None        # 實際載入後使用的裝置（"cuda" 或 "cpu"）
 
     def set_engine(self, engine: str):
         with self._lock:
@@ -79,12 +99,26 @@ class LocalTranslator:
         self._translator = None
         self._tokenizer = None
         self._kind = None
+        self.device = None
 
     def _device_candidates(self):
         """回傳 [(device, compute_type)]，依序嘗試。"""
         if self.compute_device == "cpu":
             return [("cpu", "int8")]
         return [("cuda", "int8_float16"), ("cpu", "int8")]
+
+    @staticmethod
+    def _run_batch(translator, tokenizer, kind, text, tgt) -> str:
+        source = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+        if kind == "nllb":
+            results = translator.translate_batch(
+                [source], target_prefix=[[NLLB_CODES[tgt]]], beam_size=2)
+            hypothesis = results[0].hypotheses[0][1:]  # 去掉語言標記
+        else:
+            results = translator.translate_batch([source], beam_size=2)
+            hypothesis = results[0].hypotheses[0]
+        ids = tokenizer.convert_tokens_to_ids(hypothesis)
+        return tokenizer.decode(ids, skip_special_tokens=True).strip()
 
     def ensure_loaded(self, src: str, tgt: str, progress_cb=None):
         with self._lock:
@@ -93,31 +127,34 @@ class LocalTranslator:
             repo, kind = repo_for(self.engine, src, tgt)
             if progress_cb is not None:
                 progress_cb(f"正在準備翻譯模型（{repo}）…")
-            from huggingface_hub import snapshot_download
-            path = snapshot_download(repo)
-
-            import ctranslate2
-            from transformers import AutoTokenizer
-
-            last_error = None
-            translator = None
-            for device, compute_type in self._device_candidates():
-                try:
-                    translator = ctranslate2.Translator(
-                        path, device=device, compute_type=compute_type)
-                    break
-                except Exception as e:  # GPU 不可用或記憶體不足 → 退回 CPU
-                    last_error = e
-            if translator is None:
-                raise RuntimeError(f"翻譯模型載入失敗：{last_error}")
+            path = _snapshot_download(repo)
+            register_cuda_dll_dirs()
 
             tokenizer_kwargs = {}
             if kind == "nllb":
                 tokenizer_kwargs["src_lang"] = NLLB_CODES[src]
-            self._tokenizer = AutoTokenizer.from_pretrained(
-                path, **tokenizer_kwargs)
+            tokenizer = _load_tokenizer(path, **tokenizer_kwargs)
+
+            translator = None
+            used_device = None
+            last_error = None
+            for device, compute_type in self._device_candidates():
+                try:
+                    candidate = _make_translator(path, device, compute_type)
+                    # CTranslate2 的 CUDA 函式庫是延遲載入：建構成功不代表能用，
+                    # 必須真的跑一次推論才會暴露缺 DLL 的錯誤，否則永遠不會退回 CPU
+                    self._run_batch(candidate, tokenizer, kind, "test", tgt)
+                    translator, used_device = candidate, device
+                    break
+                except Exception as e:
+                    last_error = e
+            if translator is None:
+                raise RuntimeError(f"翻譯模型載入失敗：{last_error}")
+
+            self._tokenizer = tokenizer
             self._translator = translator
             self._kind = kind
+            self.device = used_device
             self._key = (self.engine, src, tgt)
 
     def translate(self, text: str, src: str, tgt: str) -> str:
@@ -126,15 +163,5 @@ class LocalTranslator:
             return ""
         self.ensure_loaded(src, tgt)
         with self._lock:
-            tokenizer = self._tokenizer
-            source = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
-            if self._kind == "nllb":
-                results = self._translator.translate_batch(
-                    [source], target_prefix=[[NLLB_CODES[tgt]]], beam_size=2)
-                hypothesis = results[0].hypotheses[0][1:]  # 去掉語言標記
-            else:
-                results = self._translator.translate_batch(
-                    [source], beam_size=2)
-                hypothesis = results[0].hypotheses[0]
-            ids = tokenizer.convert_tokens_to_ids(hypothesis)
-            return tokenizer.decode(ids, skip_special_tokens=True).strip()
+            return self._run_batch(self._translator, self._tokenizer,
+                                   self._kind, text, tgt)

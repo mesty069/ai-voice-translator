@@ -53,3 +53,44 @@ def test_set_engine_invalidates_loaded_model():
     assert translator.is_ready("en", "zh")
     translator.set_engine("opus-mt")
     assert not translator.is_ready("en", "zh")
+
+
+def test_falls_back_to_cpu_when_cuda_fails_at_inference(monkeypatch, tmp_path):
+    """CTranslate2 的 CUDA 錯誤是延遲發生的：建構成功、推論才失敗，
+    所以只包住建構子的 try/except 永遠不會退回 CPU。"""
+    from app.core import local_translate as lt
+
+    class FakeTokenizer:
+        def encode(self, text):
+            return [1, 2]
+
+        def convert_ids_to_tokens(self, ids):
+            return ["a", "b"]
+
+        def convert_tokens_to_ids(self, tokens):
+            return [1]
+
+        def decode(self, ids, skip_special_tokens=True):
+            return "翻譯結果"
+
+    class FakeResult:
+        hypotheses = [["lang", "x"]]
+
+    class FakeTranslator:
+        def __init__(self, device):
+            self.device = device
+
+        def translate_batch(self, sources, **kwargs):
+            if self.device == "cuda":
+                raise RuntimeError("Library cublas64_12.dll is not found")
+            return [FakeResult()]
+
+    monkeypatch.setattr(lt, "_snapshot_download", lambda repo: str(tmp_path))
+    monkeypatch.setattr(lt, "_load_tokenizer",
+                        lambda path, **kwargs: FakeTokenizer())
+    monkeypatch.setattr(lt, "_make_translator",
+                        lambda path, device, compute_type: FakeTranslator(device))
+
+    translator = lt.LocalTranslator()
+    assert translator.translate("hello", "en", "zh") == "翻譯結果"
+    assert translator.device == "cpu"
