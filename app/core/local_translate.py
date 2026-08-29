@@ -1,3 +1,4 @@
+import re
 import threading
 
 from .cuda_dlls import register_cuda_dll_dirs
@@ -63,10 +64,68 @@ def to_traditional(text: str) -> str:
     return _opencc.convert(text)
 
 
+# CJK 字元範圍：中日韓表意文字＋平假名／片假名＋諺文音節，用來判斷
+# 「這個半形標點是不是緊貼著中日韓文字」。刻意用 \uXXXX 逐一寫死範圍
+# （而非在原始碼裡直接放邊界字元），避免抄錯字元誤植成別的 code point。
+_CJK_RANGES = (
+    "一-鿿"   # CJK 統一表意文字
+    "㐀-䶿"   # CJK 擴充 A 區
+    "豈-﫿"   # CJK 相容表意文字
+    "぀-ゟ"   # 平假名
+    "゠-ヿ"   # 片假名
+    "가-힯"   # 諺文音節
+)
+_CJK_CHAR = f"[{_CJK_RANGES}]"
+_FULLWIDTH_PUNCT = "。，？！：；"
+
+_ASCII_TO_FULLWIDTH = {
+    ".": "。",
+    ",": "，",
+    "?": "？",
+    "!": "！",
+    ":": "：",
+    ";": "；",
+}
+
+# 半形標點緊鄰（中間最多容許空白）中日韓文字，且後面沒有立刻接著 ASCII
+# 字母／數字（避免誤觸「3.5」「U.S.」「e.g.」網址這類 ASCII 內部的標點）
+# 才轉全形；標點與 CJK 字元之間若原本有空白，一併去掉。
+_CJK_PUNCT_RE = re.compile(
+    f"({_CJK_CHAR})\\s*([{re.escape(''.join(_ASCII_TO_FULLWIDTH))}])"
+    r"(?![A-Za-z0-9])")
+# 轉換後（或原文就已是全形標點）與下一個 CJK 字元之間如果還留著空白，
+# 中日韓文字本來就不加空白分句，一併清掉。
+_CJK_GAP_RE = re.compile(
+    f"(?<=[{_CJK_RANGES}{_FULLWIDTH_PUNCT}])\\s+(?=[{_CJK_RANGES}])")
+
+
+def normalize_cjk_punct(text: str) -> str:
+    """把緊鄰中日韓文字的半形標點（. , ? ! : ;）轉成全形，並清掉中日韓
+    文字之間多餘的空白。
+
+    NLLB/OPUS-MT 逐句翻譯後常常保留來源語言的半形標點與空白，中文/日文/
+    韓文字幕卻該用全形——但「3.5」「U.S.」「e.g.」這類 ASCII 內部的標點
+    不能被誤轉，所以只在標點緊貼 CJK 字元、且後面不是接著 ASCII 字母或
+    數字時才轉換。
+    """
+    if not text:
+        return text
+
+    def _convert(match):
+        return match.group(1) + _ASCII_TO_FULLWIDTH[match.group(2)]
+
+    text = _CJK_PUNCT_RE.sub(_convert, text)
+    text = _CJK_GAP_RE.sub("", text)
+    return text
+
+
 def postprocess(text: str, tgt: str) -> str:
-    """翻譯結果的後處理：目標為中文時轉成台灣繁體。"""
+    """翻譯結果的後處理：目標為中文時轉成台灣繁體；目標為中日韓時，
+    緊鄰 CJK 文字的半形標點一律轉全形（且清掉多餘空白）。"""
     if tgt == "zh":
-        return to_traditional(text)
+        text = to_traditional(text)
+    if tgt in ("zh", "ja", "ko"):
+        text = normalize_cjk_punct(text)
     return text
 
 

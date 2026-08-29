@@ -12,6 +12,7 @@ from app.core.local_translate import (
     ENGINE_LABELS,
     NLLB_CODES,
     LocalTranslator,
+    normalize_cjk_punct,
     repo_for,
     split_sentences,
 )
@@ -70,6 +71,41 @@ def test_postprocess_converts_to_taiwan_traditional():
 def test_postprocess_leaves_other_languages_untouched():
     from app.core.local_translate import postprocess
     assert postprocess("The server went down.", "en") == "The server went down."
+
+
+# ---- normalize_cjk_punct（F8：NLLB 逐句翻譯後半形標點沒轉成中文全形） ----
+
+def test_normalize_cjk_punct_smoke_case():
+    """實測案例：三句英文翻完後，句號/逗號緊貼中文卻是半形。"""
+    text = ("讓我們再來看看.首先,讓我們看看來源中的成分."
+            "接下來的關鍵步驟是加熱它.")
+    assert normalize_cjk_punct(text) == (
+        "讓我們再來看看。首先，讓我們看看來源中的成分。"
+        "接下來的關鍵步驟是加熱它。")
+
+
+def test_normalize_cjk_punct_keeps_decimal_point():
+    assert normalize_cjk_punct("版本 3.5 已發布.") == "版本 3.5 已發布。"
+
+
+def test_normalize_cjk_punct_keeps_abbreviation_intact():
+    result = normalize_cjk_punct("見 e.g. 這個.")
+    assert "e.g." in result
+    assert result == "見 e.g. 這個。"
+
+
+def test_normalize_cjk_punct_comma_and_strips_gap():
+    assert normalize_cjk_punct("你好, 世界") == "你好，世界"
+
+
+def test_normalize_cjk_punct_is_idempotent():
+    assert normalize_cjk_punct("你好。世界") == "你好。世界"
+
+
+def test_normalize_cjk_punct_english_target_unchanged_via_postprocess():
+    from app.core.local_translate import postprocess
+    text = "Hello, world. Nice to meet you."
+    assert postprocess(text, "en") == text
 
 
 def test_falls_back_to_cpu_when_cuda_fails_at_inference(monkeypatch, tmp_path):
