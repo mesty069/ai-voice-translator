@@ -70,7 +70,12 @@ def repo_for(engine: str, src: str, tgt: str):
 # 以下三個薄封裝讓 ensure_loaded 的載入流程可以被測試替換，
 # 不需要真的連網下載模型或有 GPU。
 def _snapshot_download(repo: str) -> str:
+    # 程式以 pythonw 執行時沒有 console（sys.stderr 為 None），
+    # huggingface_hub 的 tqdm 進度條會在 fp.write 時崩潰——即使模型已快取
+    # 也會建立進度條物件，所以一律停用。
     from huggingface_hub import snapshot_download
+    from huggingface_hub.utils import disable_progress_bars
+    disable_progress_bars()
     return snapshot_download(repo)
 
 

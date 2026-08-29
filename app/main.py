@@ -47,7 +47,17 @@ def acquire_single_instance():
     return server
 
 
+def _ensure_std_streams():
+    """pythonw / 打包 exe 沒有 console，sys.stdout/stderr 是 None；
+    任何第三方庫（tqdm、transformers 警告…）一寫就崩。給它們一個黑洞。"""
+    import os
+    for name in ("stdout", "stderr"):
+        if getattr(sys, name) is None:
+            setattr(sys, name, open(os.devnull, "w", encoding="utf-8"))
+
+
 def main():
+    _ensure_std_streams()
     # 必須在建立任何視窗前設定，執行中的視窗才會跟釘選的捷徑併成同一顆
     try:
         ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID(APP_ID)

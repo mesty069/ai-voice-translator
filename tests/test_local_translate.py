@@ -109,3 +109,30 @@ def test_falls_back_to_cpu_when_cuda_fails_at_inference(monkeypatch, tmp_path):
     translator = lt.LocalTranslator()
     assert translator.translate("hello", "en", "zh") == "翻譯結果"
     assert translator.device == "cpu"
+
+
+def test_snapshot_download_survives_no_console(monkeypatch, tmp_path):
+    """pythonw 無 console 時 sys.stderr 為 None，進度條不得讓下載崩潰。"""
+    import sys
+    from app.core import local_translate as lt
+
+    class FakeHub:
+        def __init__(self):
+            self.progress_disabled = False
+
+        def snapshot_download(self, repo):
+            # 模擬 huggingface_hub：若進度條沒被停用就建立 tqdm 寫 stderr
+            if not self.progress_disabled:
+                sys.stderr.write("progress")  # sys.stderr 是 None → AttributeError
+            return str(tmp_path)
+
+        def disable_progress_bars(self):
+            self.progress_disabled = True
+
+    hub = FakeHub()
+    import huggingface_hub, huggingface_hub.utils
+    monkeypatch.setattr(huggingface_hub, "snapshot_download", hub.snapshot_download)
+    monkeypatch.setattr(huggingface_hub.utils, "disable_progress_bars",
+                        hub.disable_progress_bars)
+    monkeypatch.setattr(sys, "stderr", None)
+    assert lt._snapshot_download("some/repo") == str(tmp_path)
