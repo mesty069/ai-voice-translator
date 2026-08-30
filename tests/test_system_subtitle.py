@@ -116,3 +116,13 @@ def test_wrapped_long_text_is_not_clipped(tmp_path, qapp):
     assert ov.width() == 360
     assert ov.height() >= ov.layout().heightForWidth(360)
     assert ov.height() > before
+
+
+def test_history_replaces_entry_when_sentence_is_merged(tmp_path, qapp):
+    """短句併進前一句後再送一次合併句 → 逐字稿只留合併後那一筆。"""
+    ov = _overlay(tmp_path, qapp)
+    ov.add_history("Please join now.", "請現在加入我們。")
+    ov.add_history("Please join now. Now.", "請現在加入我們，現在。")
+    ov.add_history("Thank you.", "謝謝你。")
+    assert ov._history == [("Please join now. Now.", "請現在加入我們，現在。"),
+                           ("Thank you.", "謝謝你。")]

@@ -176,7 +176,13 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
             self._fit_height(len(self.row_widgets))
 
     def add_history(self, original: str, translated: str):
-        self._history.append((original, translated))
+        # 短句併進前一句時會再送一次「合併後的整句」：直接取代上一筆，
+        # 逐字稿才不會同一段話出現兩次
+        last = self._history[-1][0] if self._history else None
+        if last is not None and original != last and original.startswith(last):
+            self._history[-1] = (original, translated)
+        else:
+            self._history.append((original, translated))
         if self.history_view.isVisible():
             self._refresh_history()
 
