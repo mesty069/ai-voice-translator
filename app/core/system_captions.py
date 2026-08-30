@@ -16,6 +16,7 @@ class SystemCaptionsController(QObject):
     """
 
     caption_ready = Signal(str, str)      # 原文, 母語翻譯
+    source_ready = Signal(str)            # 原文先到（翻譯還在跑），體感更即時
     state_changed = Signal(str, str)      # state, message
     fatal_error = Signal(str)             # 致命錯誤：擷取死掉、模型載不起來 → 關閉功能
 
@@ -68,9 +69,9 @@ class SystemCaptionsController(QObject):
             on_segment=lambda audio, g=gen: self._on_segment(audio, g),
             on_error=lambda error, g=gen: self._on_capture_error(error, g),
             silence_ms=self.config.get("system_captions", "segment_silence_ms",
-                                       default=600),
+                                       default=400),
             max_seconds=self.config.get("system_captions", "max_segment_sec",
-                                        default=8))
+                                        default=4))
         self._capture.start()
         self.state_changed.emit("listening", "正在聽系統聲音…")
 
@@ -164,11 +165,13 @@ class SystemCaptionsController(QObject):
             return
 
         spoken, native = self._languages()
-        text = (self.stt.transcribe(audio, language=spoken) or "").strip()
+        text = (self.stt.transcribe(audio, language=spoken, beam_size=1)
+                or "").strip()
         if gen != self._generation or not self._running:
             return  # stop() 期間或已重啟，舊結果不發訊號
         if not text:
             return
+        self.source_ready.emit(text)
 
         # 翻譯模型第一次用要下載（數百 MB），把進度報到狀態列，
         # 否則使用者只會看到字幕遲遲不出現

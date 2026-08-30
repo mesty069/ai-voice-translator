@@ -8,3 +8,4 @@ dist/
 *.spec
 gui_err.log
 .superpowers/
+.vs/

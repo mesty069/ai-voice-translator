@@ -75,7 +75,10 @@ class SpeechToText:
     def is_ready(self) -> bool:
         return self._model is not None
 
-    def transcribe(self, audio: np.ndarray, language: str = "zh") -> str:
+    def transcribe(self, audio: np.ndarray, language: str = "zh",
+               beam_size: int = 5) -> str:
+        # beam_size=5 給麥克風翻譯（一句話等結果，要準）；
+        # 即時字幕用 1（貪婪解碼），快 2–3 倍，字幕場景看不出差別
         # 麥克風與系統字幕兩條管線共用同一個模型，必須序列化，
         # 否則會同時擠 GPU 造成拖慢甚至崩潰。
         # 檢查與取用都要在鎖內、且取本地變數：在鎖外檢查的話，
@@ -87,7 +90,7 @@ class SpeechToText:
             segments, _info = model.transcribe(
                 audio,
                 language=language,
-                beam_size=5,
+                beam_size=beam_size,
                 vad_filter=True,
                 initial_prompt="以下是繁體中文的句子。" if language == "zh" else None,
             )

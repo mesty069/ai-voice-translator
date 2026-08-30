@@ -64,7 +64,7 @@ def test_system_captions_defaults(tmp_path):
     assert cfg.get("system_captions", "engine") == "nllb-600m"
     assert cfg.get("system_captions", "language") == ""
     assert cfg.get("system_captions", "compute_device") == "auto"
-    assert cfg.get("system_captions", "segment_silence_ms") == 600
+    assert cfg.get("system_captions", "segment_silence_ms") == 400
 
 
 def test_reset_restores_system_captions(tmp_path):

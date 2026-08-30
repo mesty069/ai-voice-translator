@@ -109,6 +109,11 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         self.show()
         self.setWindowOpacity(self.target_opacity())
 
+    def show_source(self, original: str):
+        """原文先上、翻譯欄位顯示等待中；不進歷史（update_caption 才進）。"""
+        self.original_label.setText(original)
+        self.translated_label.setText("翻譯中…")
+
     def update_caption(self, original: str, translated: str):
         self.original_label.setText(original)
         self.translated_label.setText(translated)

@@ -234,6 +234,7 @@ class MainWindow(FluentWindow):
             config, controller.stt, controller.mic_busy, self)
         self.system_subtitle = SystemSubtitleOverlay(config)
         self.system_captions.caption_ready.connect(self._on_system_caption)
+        self.system_captions.source_ready.connect(self._on_system_source)
         self.system_captions.state_changed.connect(self.home.set_state)
         # 暫時性錯誤只走 state_changed("error", ...) 顯示在狀態列，
         # 不彈跳窗（每段音訊都可能失敗一次，彈窗太吵）；致命錯誤才彈窗並關掉功能
@@ -407,6 +408,10 @@ class MainWindow(FluentWindow):
 
     def _current_screen(self):
         return self.screen() if self.isVisible() else self.bubble.screen()
+
+    def _on_system_source(self, original: str):
+        self.system_subtitle.show_source(original)
+        self._avoid_overlap(self.system_subtitle, self.subtitle)
 
     def _on_system_caption(self, original: str, translated: str):
         self.system_subtitle.update_caption(original, translated)

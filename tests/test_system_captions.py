@@ -18,9 +18,11 @@ class _FakeStt:
 
     def __init__(self):
         self.languages = []
+        self.beam_sizes = []
 
-    def transcribe(self, audio, language="zh"):
+    def transcribe(self, audio, language="zh", beam_size=5):
         self.languages.append(language)
+        self.beam_sizes.append(beam_size)
         return "hello world"
 
 
@@ -79,7 +81,7 @@ def test_explicit_language_overrides_target(tmp_path):
 def test_empty_transcription_emits_nothing(tmp_path):
     cfg, ctrl = _controller(tmp_path)
     ctrl._running = True
-    ctrl.stt.transcribe = lambda audio, language="zh": "   "
+    ctrl.stt.transcribe = lambda audio, language="zh", beam_size=5: "   "
     captions = []
     ctrl.caption_ready.connect(lambda a, b: captions.append((a, b)))
     ctrl._process(np.zeros(16000, dtype=np.float32), ctrl._generation)
@@ -302,7 +304,7 @@ class _LateReadyStt:
     def is_ready(self):
         return time.monotonic() >= self._ready_at
 
-    def transcribe(self, audio, language="zh"):
+    def transcribe(self, audio, language="zh", beam_size=5):
         assert self.is_ready, "模型還沒載入完就去辨識了"
         return "hello world"
 
@@ -331,7 +333,7 @@ class _NeverReadyStt:
 
     is_ready = False
 
-    def transcribe(self, audio, language="zh"):
+    def transcribe(self, audio, language="zh", beam_size=5):
         raise AssertionError("不該辨識：STT 從未就緒")
 
 
@@ -350,3 +352,23 @@ def test_stt_wait_timeout_is_fatal(tmp_path):
 
     assert fatals == ["語音模型載入逾時，系統字幕已停止"]
     assert captions == []
+
+
+def test_source_text_is_emitted_before_translation(tmp_path):
+    """原文先上字幕、翻譯完成再補：體感延遲減半。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._running = True
+    events = []
+    ctrl.source_ready.connect(lambda a: events.append(("source", a)))
+    ctrl.caption_ready.connect(lambda a, b: events.append(("caption", a, b)))
+    ctrl._process(np.zeros(16000, dtype=np.float32), ctrl._generation)
+    assert events == [("source", "hello world"),
+                      ("caption", "hello world", "你好世界")]
+
+
+def test_live_captions_use_greedy_decoding(tmp_path):
+    """即時字幕用 beam_size=1（麥克風翻譯維持 5），速度優先。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl._running = True
+    ctrl._process(np.zeros(16000, dtype=np.float32), ctrl._generation)
+    assert ctrl.stt.beam_sizes == [1]

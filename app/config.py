@@ -107,8 +107,8 @@ DEFAULT_CONFIG = {
         "font_size": 20,
         "opacity": 100,
         "bg_color": "#0d2b33",
-        "segment_silence_ms": 600,
-        "max_segment_sec": 8,
+        "segment_silence_ms": 400,
+        "max_segment_sec": 4,
     },
     "ui": {
         "theme": "auto",
