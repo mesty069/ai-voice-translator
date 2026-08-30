@@ -1,47 +1,37 @@
-import queue
-import threading
-import time
-
 from PySide6.QtCore import QObject, Signal
 
-from .local_translate import LocalTranslator, ModelLoadError
-from .system_audio import SystemAudioCapture
+from .local_translate import LocalTranslator
+from .streaming_captions import DISPLAY_ROWS, StreamingCaptionEngine
+from .system_audio import RollingAudioBuffer, SystemAudioCapture
 
 
 class SystemCaptionsController(QObject):
-    """把「系統聲音 → 文字 → 母語翻譯」串起來。
+    """組裝「系統聲音擷取 → 滾動緩衝 → 串流引擎 → 本機翻譯」，把回呼轉成 Qt 訊號。
 
-    擷取與處理都在自己的執行緒，不佔用麥克風流程的 executor。
-    麥克風正在使用時先讓路，避免使用者說話被系統字幕的辨識卡住。
+    世代編號：每次 start() 遞增；stop() 之後舊 capture／engine 的回呼一律忽略。
     """
 
-    caption_ready = Signal(str, str)      # 原文, 母語翻譯
-    source_ready = Signal(str)            # 原文先到（翻譯還在跑），體感更即時
-    state_changed = Signal(str, str)      # state, message
-    fatal_error = Signal(str)             # 致命錯誤：擷取死掉、模型載不起來 → 關閉功能
-
-    MAX_QUEUE = 3  # 積壓超過就丟掉最舊的，即時性優先
-    STT_WAIT_TIMEOUT = 300.0  # 等語音模型載入的上限（large-v3 首次載入很久）
+    rows_changed = Signal(object)          # list[Row]
+    sentence_finalized = Signal(str, str)  # 完成句 (原文, 翻譯) → 歷史面板
+    state_changed = Signal(str, str)       # state, message
+    fatal_error = Signal(str)              # 擷取死掉、模型載不起來 → 關閉功能
 
     def __init__(self, config, stt, mic_busy, parent=None):
         super().__init__(parent)
         self.config = config
         self.stt = stt
         self._mic_busy = mic_busy
-        self._mic_wait_timeout = 10.0
         self._translator = LocalTranslator(
-            engine=config.get("system_captions", "engine",
-                              default="nllb-600m"),
+            engine=config.get("system_captions", "engine", default="nllb-600m"),
             compute_device=config.get("system_captions", "compute_device",
                                       default="auto"))
-        self._capture = None
         self._capture_factory = SystemAudioCapture
-        self._queue = queue.Queue()
-        self._worker = None
+        self._engine_factory = StreamingCaptionEngine
+        self._capture = None
+        self._engine = None
+        self._buffer = None
         self._running = False
-        self._generation = 0   # 每次 start() 遞增；舊 worker 看到不一致就退出、不發訊號
-
-    # ---- 生命週期 ----
+        self._generation = 0
 
     @property
     def is_running(self) -> bool:
@@ -53,156 +43,68 @@ class SystemCaptionsController(QObject):
         self._running = True
         self._generation += 1
         gen = self._generation
-        # 換新佇列：舊 worker 就算晚醒來也吃不到新的分段
-        self._queue = queue.Queue()
         self._translator.set_engine(
             self.config.get("system_captions", "engine", default="nllb-600m"))
         self._translator.set_compute_device(
-            self.config.get("system_captions", "compute_device",
-                            default="auto"))
-        self._worker = threading.Thread(
-            target=self._work, args=(gen,), daemon=True, name="system-captions")
-        self._worker.start()
+            self.config.get("system_captions", "compute_device", default="auto"))
+        self._buffer = RollingAudioBuffer()
+        buffer = self._buffer
+        self._engine = self._engine_factory(
+            buffer, self.stt, self._translator,
+            languages=self._languages, mic_busy=self._mic_busy,
+            on_rows=lambda rows, g=gen: self._guarded(g, self.rows_changed.emit, rows),
+            on_state=lambda s, m, g=gen: self._guarded(g, self.state_changed.emit, s, m),
+            on_fatal=lambda msg, g=gen: self._on_fatal(msg, g),
+            on_final=lambda o, t, g=gen: self._guarded(g, self.sentence_finalized.emit, o, t),
+            display_rows=self.config.get("system_captions", "display_rows",
+                                         default=DISPLAY_ROWS))
+        self._engine.start()
         self._capture = self._capture_factory(
             device_name=self.config.get("system_captions", "device",
                                         default="default"),
-            on_segment=lambda audio, g=gen: self._on_segment(audio, g),
-            on_error=lambda error, g=gen: self._on_capture_error(error, g),
-            silence_ms=self.config.get("system_captions", "segment_silence_ms",
-                                       default=400),
-            max_seconds=self.config.get("system_captions", "max_segment_sec",
-                                        default=4))
+            on_frames=lambda frames, g=gen, b=buffer: self._on_frames(frames, g, b),
+            on_error=lambda error, g=gen: self._on_fatal(
+                f"系統聲音擷取失敗：{error}", g))
         self._capture.start()
         self.state_changed.emit("listening", "正在聽系統聲音…")
 
     def stop(self):
-        # 沒在跑的話直接返回，避免 UI 重複呼叫 stop 時狂洗狀態列
-        if not self._running and self._capture is None:
+        if not self._running and self._capture is None and self._engine is None:
             return
         self._running = False
-        # 世代先變號，就算舊 worker 之後才醒來，也無法再發訊號或吃到新佇列
-        self._generation += 1
-        # 注意：_capture.stop() 內部仍會把累積到一半的尾段 flush 出來，
-        # 但因為上面已經把 _running 關掉、世代也變了，_on_segment 會直接丟棄它
-        # （見下方 _on_segment）。這是刻意的行為，不是漏洞：使用者關掉字幕
-        # 之後（overlay 已經隱藏）不該再冒出新字幕；flush 是 SystemAudioCapture
-        # 自己元件契約的一部分（見 test_stop_flushes_pending_tail），不是為了
-        # 讓 stop() 後還能送出字幕而存在。
-        if self._capture is not None:
-            self._capture.stop()
-            self._capture = None
-        self._queue.put(None)  # 叫醒目前這個佇列的工作執行緒
-        worker, self._worker = self._worker, None
-        if worker is not None:
-            # 世代已經變號，舊 worker 就算還活著也發不出任何訊號，可以直接丟著；
-            # 這裡只是順手收屍，絕不能在 GUI 執行緒上久等
-            worker.join(timeout=0.1)
+        self._generation += 1   # 先變號：舊回呼從此無效
+        capture, self._capture = self._capture, None
+        engine, self._engine = self._engine, None
+        if capture is not None:
+            capture.stop()      # join ≤ 0.2s
+        if engine is not None:
+            engine.stop()       # join ≤ 0.1s
         self.state_changed.emit("idle", "已停止系統聲音字幕")
 
-    # ---- 語言 ----
+    def set_display_rows(self, n: int):
+        if self._engine is not None:
+            self._engine.set_display_rows(n)
+
+    # ---- 內部 ----
 
     def _languages(self):
-        """回傳 (辨識語言, 翻譯目標語言)。"""
+        """(辨識語言, 翻譯目標語言)：預設辨識「目標語言」、翻成「母語」。"""
         native = self.config.get("language", "source", default="zh")
         target = self.config.get("language", "target", default="en")
         spoken = self.config.get("system_captions", "language", default="")
         return (spoken or target), native
 
-    # ---- 管線 ----
+    def _guarded(self, gen, emit, *args):
+        if gen == self._generation and self._running:
+            emit(*args)
 
-    def _on_segment(self, audio, gen):
-        if gen != self._generation or not self._running:
-            return  # 舊世代的擷取執行緒，不得餵進新佇列
-        # 先取本地變數，避免 start() 同時換新佇列造成 trim/put 對不上
-        q = self._queue
-        while q.qsize() >= self.MAX_QUEUE:
-            try:
-                q.get_nowait()
-            except queue.Empty:
-                break
-        q.put(audio)
+    def _on_frames(self, frames, gen, buffer):
+        if gen == self._generation and self._running:
+            buffer.append(frames)
 
-    def _on_capture_error(self, error, gen):
+    def _on_fatal(self, message, gen):
         if gen != self._generation:
-            return  # 舊世代擷取執行緒遲來的錯誤，忽略即可
+            return
         self._running = False
-        # 擷取執行緒已經死了，重試也沒用 → 致命錯誤，由 UI 關掉功能
-        self.fatal_error.emit(f"系統聲音擷取失敗：{error}")
-        self.state_changed.emit("error", "系統聲音擷取失敗")
-        self._queue.put(None)  # 叫醒卡在 queue.get() 的工作執行緒，避免永遠卡住
-
-    def _work(self, gen):
-        try:
-            import comtypes
-            comtypes.CoInitialize()
-        except Exception:
-            pass
-        while self._running and gen == self._generation:
-            audio = self._queue.get()
-            if gen != self._generation or not self._running:
-                break
-            if audio is None:
-                break
-            try:
-                self._process(audio, gen)
-            except Exception as e:
-                if gen != self._generation or not self._running:
-                    break  # 已經 stop()/重啟，舊世代不得再發訊號
-                if isinstance(e, ModelLoadError):
-                    # 模型載不起來，之後每一段都會一樣失敗 → 關掉功能
-                    self.fatal_error.emit(str(e))
-                    break
-                # 其餘（單段音訊有問題等）只是暫時狀況，繼續聽下一段
-                self.state_changed.emit("error", f"系統字幕處理失敗：{e}")
-
-    def _process(self, audio, gen):
-        # 麥克風優先：使用者正在說話時先讓路
-        deadline = time.monotonic() + self._mic_wait_timeout
-        while self._mic_busy() and time.monotonic() < deadline:
-            time.sleep(0.05)
-
-        if not self._wait_for_stt(gen):
-            return
-
-        spoken, native = self._languages()
-        text = (self.stt.transcribe(audio, language=spoken, beam_size=1)
-                or "").strip()
-        if gen != self._generation or not self._running:
-            return  # stop() 期間或已重啟，舊結果不發訊號
-        if not text:
-            return
-        self.source_ready.emit(text)
-
-        # 翻譯模型第一次用要下載（數百 MB），把進度報到狀態列，
-        # 否則使用者只會看到字幕遲遲不出現
-        announced = []
-
-        def progress(message):
-            if gen == self._generation and self._running:
-                announced.append(True)
-                self.state_changed.emit("loading", message)
-
-        translated = self._translator.translate(text, spoken, native,
-                                                progress_cb=progress)
-        if gen != self._generation or not self._running:
-            return  # translate() 耗時，回來後可能已經被 stop()/重啟
-        if announced:
-            self.state_changed.emit("listening", "正在聽系統聲音…")
-        self.caption_ready.emit(text, translated)
-
-    def _wait_for_stt(self, gen) -> bool:
-        """語音模型還在載入時等它（開機就按熱鍵的情境）。回傳是否可以繼續。"""
-        if self.stt.is_ready:
-            return True
-        self.state_changed.emit("loading", "語音模型載入中，系統字幕稍後開始…")
-        deadline = time.monotonic() + self.STT_WAIT_TIMEOUT
-        while not self.stt.is_ready:
-            if gen != self._generation or not self._running:
-                return False
-            if time.monotonic() >= deadline:
-                self.fatal_error.emit("語音模型載入逾時，系統字幕已停止")
-                return False
-            time.sleep(0.2)
-        if gen != self._generation or not self._running:
-            return False
-        return True
+        self.fatal_error.emit(message)
+        self.state_changed.emit("error", message)
