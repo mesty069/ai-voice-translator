@@ -65,7 +65,6 @@ def test_system_captions_defaults(tmp_path):
     assert cfg.get("system_captions", "language") == ""
     assert cfg.get("system_captions", "compute_device") == "auto"
     assert cfg.get("system_captions", "display_rows") == 3
-    assert cfg.get("system_captions", "segment_silence_ms") is None
 
 
 def test_reset_restores_system_captions(tmp_path):

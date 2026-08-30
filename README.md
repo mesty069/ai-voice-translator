@@ -69,8 +69,9 @@ python -m venv .venv
 - 翻譯不走 DeepSeek，模型可在設定頁切換（NLLB 600M / 1.3B / OPUS-MT），
   首次使用會自動下載，之後離線可用。
 - 字幕可拖動、調大小、調透明度；與麥克風字幕重疊時會自動推開。
-- 為了即時性，每段最長 4 秒、停頓 0.4 秒就切句（設定頁可調）；原文先出現，翻譯完成再補上。
-  想更快就把「每段最長」調短，想句子完整就調長。
+- Live Captions 風格：每秒重新辨識「上一句句尾之後」的聲音，正在講的句子邊講邊長；
+  文字穩定約 2 秒或講完一句就翻譯，文字變了會重翻，相同不重翻。
+- 疊加層顯示最近 3 行（設定頁 1–5 行），新句進來舊句往上頂掉；正在講的那句最亮。
 - 「歷史」按鈕可展開本次的整段逐字稿並複製。
 
 ## 架構重點
@@ -90,7 +91,8 @@ python -m venv .venv
   在獨立執行緒執行，不占用翻譯流程的工作佇列。
 - 設計文件：`docs/superpowers/specs/2026-08-21-voice-translator-design.md`
 - 系統聲音擷取（`app/core/system_audio.py`）：PortAudio 沒有 loopback 裝置，
-  改用 `soundcard` 的 WASAPI loopback；能量門檻切句後才送辨識。
+  改用 `soundcard` 的 WASAPI loopback；連續音框進滾動緩衝，串流引擎
+  （`app/core/streaming_captions.py`）每秒重新辨識開放窗。
 - 本機翻譯（`app/core/local_translate.py`）：直接用 faster-whisper 已安裝的 CTranslate2 跑 NLLB/OPUS-MT，刻意避開 Argos Translate
   （會引入 torch+spacy+stanza 約 2–3GB）。
 

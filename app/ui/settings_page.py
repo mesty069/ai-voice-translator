@@ -235,16 +235,11 @@ class SettingsInterface(ScrollArea):
         self.system_compute_combo = ComboBox(self.view)
         self.system_compute_combo.addItems(["自動（優先 GPU）", "只用 CPU"])
         self._add_row(layout, "翻譯運算裝置", self.system_compute_combo)
-        self.system_segment_spin = SpinBox(self.view)
-        self.system_segment_spin.setRange(2, 10)
-        self.system_segment_spin.setSuffix(" 秒")
-        self._add_row(layout, "每段最長（越短字幕越快出現，但句子會被切開）",
-                      self.system_segment_spin)
-        self.system_pause_spin = SpinBox(self.view)
-        self.system_pause_spin.setRange(200, 1500)
-        self.system_pause_spin.setSingleStep(100)
-        self.system_pause_spin.setSuffix(" ms")
-        self._add_row(layout, "停頓多久算一句", self.system_pause_spin)
+        self.system_rows_spin = SpinBox(self.view)
+        self.system_rows_spin.setRange(1, 5)
+        self.system_rows_spin.setSuffix(" 行")
+        self._add_row(layout, "同時顯示幾行（最近幾句 + 正在講的這句）",
+                      self.system_rows_spin)
         self.system_font_spin = SpinBox(self.view)
         self.system_font_spin.setRange(12, 48)
         self.system_font_spin.setSuffix(" px")
@@ -484,9 +479,7 @@ class SettingsInterface(ScrollArea):
             self.system_engine_combo.setCurrentIndex(engine_ids.index(engine))
         self.system_compute_combo.setCurrentIndex(
             1 if cfg.get(sc, "compute_device", default="auto") == "cpu" else 0)
-        self.system_segment_spin.setValue(cfg.get(sc, "max_segment_sec", default=4))
-        self.system_pause_spin.setValue(
-            cfg.get(sc, "segment_silence_ms", default=400))
+        self.system_rows_spin.setValue(cfg.get(sc, "display_rows", default=3))
         self.system_font_spin.setValue(cfg.get(sc, "font_size", default=20))
         self.system_opacity_spin.setValue(cfg.get(sc, "opacity", default=100))
 
@@ -582,9 +575,7 @@ class SettingsInterface(ScrollArea):
             self._on_system_settings_changed)
         self.system_compute_combo.currentIndexChanged.connect(
             self._on_system_settings_changed)
-        self.system_segment_spin.valueChanged.connect(
-            self._on_system_settings_changed)
-        self.system_pause_spin.valueChanged.connect(
+        self.system_rows_spin.valueChanged.connect(
             self._on_system_settings_changed)
         self.system_font_spin.valueChanged.connect(
             self._on_system_settings_changed)
@@ -820,8 +811,7 @@ class SettingsInterface(ScrollArea):
         if self._loading:
             return
         sc = "system_captions"
-        pipeline_keys = ("device", "engine", "compute_device",
-                         "max_segment_sec", "segment_silence_ms")
+        pipeline_keys = ("device", "engine", "compute_device")
         before = tuple(self.config.get(sc, k) for k in pipeline_keys)
         index = self.system_device_combo.currentIndex()
         self.config.set(sc, "device", "default" if index == 0
@@ -834,8 +824,7 @@ class SettingsInterface(ScrollArea):
         self.config.set(sc, "compute_device",
                         "cpu" if self.system_compute_combo.currentIndex() == 1
                         else "auto")
-        self.config.set(sc, "max_segment_sec", self.system_segment_spin.value())
-        self.config.set(sc, "segment_silence_ms", self.system_pause_spin.value())
+        self.config.set(sc, "display_rows", self.system_rows_spin.value())
         self.config.set(sc, "font_size", self.system_font_spin.value())
         self.config.set(sc, "opacity", self.system_opacity_spin.value())
         self.system_captions_settings_changed.emit()

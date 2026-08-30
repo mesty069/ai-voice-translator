@@ -233,8 +233,8 @@ class MainWindow(FluentWindow):
         self.system_captions = SystemCaptionsController(
             config, controller.stt, controller.mic_busy, self)
         self.system_subtitle = SystemSubtitleOverlay(config)
-        self.system_captions.caption_ready.connect(self._on_system_caption)
-        self.system_captions.source_ready.connect(self._on_system_source)
+        self.system_captions.rows_changed.connect(self._on_system_rows)
+        self.system_captions.sentence_finalized.connect(self._on_system_final)
         self.system_captions.state_changed.connect(self.home.set_state)
         # 暫時性錯誤只走 state_changed("error", ...) 顯示在狀態列，
         # 不彈跳窗（每段音訊都可能失敗一次，彈窗太吵）；致命錯誤才彈窗並關掉功能
@@ -381,6 +381,8 @@ class MainWindow(FluentWindow):
     def _apply_system_caption_style(self):
         self.system_subtitle.apply_style()
         self.system_subtitle.apply_opacity()
+        self.system_captions.set_display_rows(
+            self.config.get("system_captions", "display_rows", default=3))
 
     def _on_system_pipeline_changed(self):
         """擷取裝置／翻譯引擎／運算裝置改了：這些只在 start() 時讀取，
@@ -409,13 +411,12 @@ class MainWindow(FluentWindow):
     def _current_screen(self):
         return self.screen() if self.isVisible() else self.bubble.screen()
 
-    def _on_system_source(self, original: str):
-        self.system_subtitle.show_source(original)
+    def _on_system_rows(self, rows):
+        self.system_subtitle.set_rows(rows)
         self._avoid_overlap(self.system_subtitle, self.subtitle)
 
-    def _on_system_caption(self, original: str, translated: str):
-        self.system_subtitle.update_caption(original, translated)
-        self._avoid_overlap(self.system_subtitle, self.subtitle)
+    def _on_system_final(self, original: str, translated: str):
+        self.system_subtitle.add_history(original, translated)
 
     def _avoid_overlap(self, mover, fixed):
         """兩個字幕都在畫面上時，把 mover 推開到不重疊的位置。"""
