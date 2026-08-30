@@ -93,6 +93,8 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         # 下：當前句原文
         self.original_label = QLabel("", self)
         self.original_label.setWordWrap(True)
+        # 原文可能長得像 HTML（<b>、&），一律當純文字顯示
+        self.original_label.setTextFormat(Qt.TextFormat.PlainText)
         self.rows_layout.addWidget(self.original_label)
         outer.addLayout(self.rows_layout)
         outer.addStretch(1)

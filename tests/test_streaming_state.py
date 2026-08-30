@@ -72,7 +72,8 @@ def test_current_grows_and_translates_after_idle_seconds():
     assert st.update_current("The meeting", 0.0) is False
     assert st.rows == [Row("The meeting", "", False)]
     assert st.update_current("The meeting", 1.0) is False       # 還沒停夠久
-    assert st.update_current("The meeting", IDLE_SEC + 0.05) is True
+    # 邊界：剛好 IDLE_SEC 就要翻（對應參考實作 idleCount == MaxIdleInterval）
+    assert st.update_current("The meeting", IDLE_SEC) is True
     st.set_current_translation("會議")
     assert st.rows == [Row("The meeting", "會議", False)]
 
