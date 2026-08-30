@@ -24,7 +24,8 @@ MIN_PEAK = 0.01            # 低於此視為靜音
 @dataclass
 class Sentence:
     text: str
-    end: float   # 最後一個字的 end（秒，相對於送進辨識的音訊起點）
+    end: float          # 最後一個字的 end（秒，相對於送進辨識的音訊起點）
+    start: float = 0.0  # 第一個字的 start（同一個時間軸）
 
 
 @dataclass
@@ -60,11 +61,12 @@ def split_sentences_by_words(words):
         pending.append(w)
         if w.text and w.text[-1] in PUNC_EOS:
             completed.append(Sentence(join_words([p.text for p in pending]),
-                                      pending[-1].end))
+                                      pending[-1].end, pending[0].start))
             pending = []
     current = None
     if pending:
-        current = Sentence(join_words([p.text for p in pending]), pending[-1].end)
+        current = Sentence(join_words([p.text for p in pending]),
+                           pending[-1].end, pending[0].start)
     return completed, current
 
 
@@ -286,7 +288,7 @@ class StreamingCaptionEngine:
         if forced:
             completed, current = [current], None
 
-        for sentence in completed:
+        for i, sentence in enumerate(completed):
             # 先翻譯、再 commit：翻譯丟例外時這一輪什麼都沒動（句子沒進
             # finals、committed_t 沒推進），同一段音訊下一輪會整句重來。
             # 「前一句」也要在 commit_text 之前取：commit_text 會把這句自己
@@ -296,7 +298,17 @@ class StreamingCaptionEngine:
             translated = self._translate(sentence.text, spoken, native, prev=prev)
             row = self.state.commit_text(sentence.text)
             row.translated = translated
-            self.committed_t = base_t + sentence.end
+            # 推進到「下一個還沒收的字」的起點，而不是這句最後一個字的
+            # end：whisper 的 DTW 常把 end 抓得偏早，停在那裡的話句尾殘音
+            # 還留在窗裡，下一輪會被辨識成一個碎片句（例如 "there."），
+            # 變成重複的完成句與歷史列。
+            if i + 1 < len(completed):
+                next_start = completed[i + 1].start
+            elif current is not None:
+                next_start = current.start
+            else:
+                next_start = sentence.end
+            self.committed_t = base_t + next_start
             if self._running:
                 self._on_final(row.original, row.translated)
         if completed:

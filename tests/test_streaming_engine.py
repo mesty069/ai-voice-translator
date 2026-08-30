@@ -104,7 +104,10 @@ def test_completed_sentence_commits_and_advances_window():
     eng, buf, sink = _engine(stt, tr)
     buf.append(_speech(2.0))
     eng.step()
-    assert abs(eng.committed_t - 0.8) < 1e-6
+    # 推到「下一個還沒收的字」的起點 1.2，不是句尾字的 end 0.8：
+    # end 常被 DTW 抓得偏早，停在那裡的話殘音下一輪會再被
+    # 辨識成碎片句（例如 "there."），歷史就多一列重複。
+    assert abs(eng.committed_t - 1.2) < 1e-6
     assert tr.calls == ["Hello there."]
     assert sink.finals == [("Hello there.", "譯[Hello there.]")]
     rows = sink.rows[-1]
@@ -112,9 +115,9 @@ def test_completed_sentence_commits_and_advances_window():
     assert rows[1].original == "Next" and rows[1].is_final is False
     # 下一輪只送 committed_t 之後的音訊
     eng.step()
-    assert stt.calls[-1][0] == int(SAMPLE_RATE * 2.0) - int(SAMPLE_RATE * 0.8)
+    assert stt.calls[-1][0] == int(SAMPLE_RATE * 2.0) - round(SAMPLE_RATE * 1.2)
     assert stt.calls[-1][2] == 1                 # beam_size=1：串流要快
-    assert abs(buf.start_seconds - 0.8) < 1e-6   # 已 trim
+    assert abs(buf.start_seconds - 1.2) < 1e-6   # 已 trim
 
 
 def test_short_final_sentence_is_translated_with_previous():
@@ -352,16 +355,17 @@ def test_start_twice_does_not_spawn_second_thread():
 # ---- 修復波 2 ----
 
 class _FlakyTranslator:
-    """前 N 次呼叫丟例外，之後正常翻譯（模擬短暫的 GPU／記憶體錯誤）。"""
+    """指定第幾次呼叫要丟例外（模擬短暫的 GPU／記憶體錯誤）。"""
 
-    def __init__(self, fail_times=1, error=None):
+    def __init__(self, fail_on=(1,), error=None):
         self.calls = []
-        self.remaining_failures = fail_times
+        self.attempts = 0
+        self.fail_on = set(fail_on)
         self.error = error or RuntimeError("cuda oom")
 
     def translate(self, text, src, tgt, progress_cb=None):
-        if self.remaining_failures > 0:
-            self.remaining_failures -= 1
+        self.attempts += 1
+        if self.attempts in self.fail_on:
             raise self.error
         self.calls.append(text)
         return f"譯[{text}]"
@@ -404,3 +408,14 @@ def test_pending_sentence_is_retried_when_translation_fails():
     assert sink.finals == [("Trailing", "譯[Trailing]")]
     assert eng.state.rows[-1].is_final is True
     assert abs(eng.committed_t - buf.total_seconds) < 1e-6
+
+
+def test_committed_t_stops_at_next_sentence_start_when_translation_fails():
+    """F2：前一句收完、第二句翻譯失敗 → committed_t 停在第二句的起點。"""
+    stt = _ScriptedStt([[Word("One.", 0.0, 0.4), Word("Two.", 1.0, 1.4)]])
+    tr = _FlakyTranslator(fail_on=(2,))
+    eng, buf, sink = _engine(stt, tr)
+    buf.append(_speech(2.0))
+    eng.step()
+    assert sink.finals == [("One.", "譯[One.]")]
+    assert abs(eng.committed_t - 1.0) < 1e-6     # 不是 "One." 的 end 0.4

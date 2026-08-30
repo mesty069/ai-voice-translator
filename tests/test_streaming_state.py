@@ -41,7 +41,7 @@ def test_split_completed_and_current():
              _w("Next", 0.9, 1.1), _w("one", 1.2, 1.4)]
     completed, current = split_sentences_by_words(words)
     assert completed == [Sentence("The end.", 0.6)]
-    assert current == Sentence("Next one", 1.4)
+    assert current == Sentence("Next one", 1.4, 0.9)
 
 
 def test_split_all_complete_has_no_current():
@@ -59,7 +59,7 @@ def test_split_cjk_eos():
     completed, current = split_sentences_by_words(
         [_w("你好", 0.0, 0.4), _w("。", 0.4, 0.5), _w("再", 0.7, 0.9)])
     assert completed == [Sentence("你好。", 0.5)]
-    assert current == Sentence("再", 0.9)
+    assert current == Sentence("再", 0.9, 0.7)
 
 
 # ---- CaptionState ----
@@ -177,3 +177,19 @@ def test_current_row_is_a_copy_of_the_pending_row():
     assert row == Row("Trailing", "尾句", False)
     row.original = "mutated"
     assert st.current_row.original == "Trailing"
+
+
+def test_split_fills_sentence_start_from_first_word():
+    """F2：引擎要把 committed_t 推到下一句的起點，所以 Sentence 得帶著 start。"""
+    words = [_w("The", 0.5, 0.7), _w("end.", 0.8, 1.0),
+             _w("Next", 1.6, 1.8), _w("one.", 1.9, 2.1),
+             _w("More", 2.6, 2.8)]
+    completed, current = split_sentences_by_words(words)
+    assert [(s.text, s.start, s.end) for s in completed] == [
+        ("The end.", 0.5, 1.0), ("Next one.", 1.6, 2.1)]
+    assert (current.start, current.end) == (2.6, 2.8)
+
+
+def test_sentence_start_defaults_to_zero():
+    """start 是補在第三個欄位的，舊的 Sentence(text, end) 寫法要照舊可用。"""
+    assert Sentence("x", 0.6) == Sentence("x", 0.6, 0.0)
