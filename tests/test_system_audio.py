@@ -3,97 +3,80 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from app.core.system_audio import SAMPLE_RATE, SegmentAccumulator
-
-
-def _speech(seconds):
-    n = int(SAMPLE_RATE * seconds)
-    t = np.arange(n) / SAMPLE_RATE
-    return (0.2 * np.sin(2 * np.pi * 220 * t)).astype(np.float32)
+from app.core.system_audio import (  # noqa: E402
+    SAMPLE_RATE,
+    RollingAudioBuffer,
+    SystemAudioCapture,
+)
 
 
-def _silence(seconds):
-    return np.zeros(int(SAMPLE_RATE * seconds), dtype=np.float32)
+def _sec(n, value=0.5):
+    return np.full(int(SAMPLE_RATE * n), value, dtype=np.float32)
 
 
-def _feed(acc, audio, block=1600):
-    out = []
-    for i in range(0, len(audio), block):
-        out.extend(acc.push(audio[i:i + block]))
-    return out
+def test_append_advances_absolute_time():
+    buf = RollingAudioBuffer()
+    buf.append(_sec(1.0))
+    buf.append(_sec(0.5))
+    assert abs(buf.total_seconds - 1.5) < 1e-6
+    assert buf.start_seconds == 0.0
 
 
-def test_silence_produces_nothing():
-    acc = SegmentAccumulator()
-    assert _feed(acc, _silence(3.0)) == []
+def test_since_returns_audio_from_absolute_time():
+    buf = RollingAudioBuffer()
+    buf.append(_sec(1.0, 0.1))
+    buf.append(_sec(1.0, 0.2))
+    out = buf.since(1.0)
+    assert len(out) == SAMPLE_RATE
+    assert np.allclose(out, 0.2)
 
 
-def test_speech_then_silence_emits_one_segment():
-    acc = SegmentAccumulator(silence_ms=600, min_seconds=0.8)
-    segments = _feed(acc, np.concatenate([_speech(2.0), _silence(1.0)]))
-    assert len(segments) == 1
-    assert len(segments[0]) >= int(SAMPLE_RATE * 2.0)
+def test_trim_keeps_absolute_time_axis():
+    buf = RollingAudioBuffer()
+    buf.append(_sec(2.0, 0.1))
+    buf.trim_before(1.5)
+    buf.append(_sec(1.0, 0.3))
+    assert abs(buf.start_seconds - 1.5) < 1e-6
+    assert abs(buf.total_seconds - 3.0) < 1e-6
+    out = buf.since(2.0)          # 絕對秒 2.0 起 = 剛加進去的那 1 秒
+    assert len(out) == SAMPLE_RATE
+    assert np.allclose(out, 0.3)
 
 
-def test_short_blip_is_discarded():
-    acc = SegmentAccumulator(silence_ms=600, min_seconds=0.8)
-    assert _feed(acc, np.concatenate([_speech(0.3), _silence(1.0)])) == []
+def test_since_before_start_clamps_to_start():
+    buf = RollingAudioBuffer()
+    buf.append(_sec(2.0, 0.1))
+    buf.trim_before(1.0)
+    assert len(buf.since(0.0)) == SAMPLE_RATE
 
 
-def test_long_speech_is_force_cut():
-    acc = SegmentAccumulator(silence_ms=600, max_seconds=4.0)
-    segments = _feed(acc, _speech(9.0))
-    assert len(segments) >= 2
-    for seg in segments:
-        assert len(seg) <= int(SAMPLE_RATE * 4.0) + 1600
+def test_max_seconds_auto_trims():
+    buf = RollingAudioBuffer(max_seconds=2.0)
+    buf.append(_sec(3.0))
+    assert buf.total_seconds - buf.start_seconds <= 2.0 + 1e-6
+    assert abs(buf.total_seconds - 3.0) < 1e-6
 
 
-def test_speech_after_force_cut_still_accumulates():
-    acc = SegmentAccumulator(silence_ms=600, max_seconds=2.0, min_seconds=0.5)
-    first = _feed(acc, _speech(5.0))
-    rest = _feed(acc, _silence(1.0))
-    assert len(first) >= 2
-    assert len(rest) == 1
+def test_tail_peak():
+    buf = RollingAudioBuffer()
+    buf.append(_sec(1.0, 0.8))
+    buf.append(_sec(1.0, 0.0))
+    assert buf.tail_peak(0.5) == 0.0
+    assert buf.tail_peak(1.5) > 0.7
+    assert RollingAudioBuffer().tail_peak(1.0) == 0.0
 
 
-def test_drain_returns_pending_audio():
-    acc = SegmentAccumulator(min_seconds=0.5)
-    acc.push(_speech(1.0))
-    tail = acc.drain()
-    assert tail is not None
-    assert len(tail) >= int(SAMPLE_RATE * 1.0)
+def test_since_with_empty_buffer_is_empty():
+    assert len(RollingAudioBuffer().since(0.0)) == 0
 
 
-def _background(seconds, amplitude=0.03):
-    """模擬桌面持續背景音（實測本機為 0.03 以上）。"""
-    n = int(SAMPLE_RATE * seconds)
-    t = np.arange(n) / SAMPLE_RATE
-    return (amplitude * np.sin(2 * np.pi * 60 * t)).astype(np.float32)
-
-
-def test_constant_background_does_not_block_segmentation():
-    """回歸測試：持續背景音高於任何固定門檻時，仍要切得出段落。"""
-    acc = SegmentAccumulator(silence_ms=600, min_seconds=0.8)
-    audio = np.concatenate([_background(1.0), _speech(2.0), _background(1.5)])
-    segments = _feed(acc, audio)
-    assert len(segments) == 1
-
-
-def test_pure_silence_segment_is_discarded_on_force_cut():
-    """整段都是數位靜音時，即使觸發強制切段也不該送出。"""
-    acc = SegmentAccumulator(silence_ms=600, max_seconds=2.0, min_seconds=0.5)
-    assert _feed(acc, _silence(6.0)) == []
-
+# ---- SystemAudioCapture：假 soundcard，確認每塊音框都原樣送出 ----
 
 class _FakeRecorder:
-    """假的 loopback 錄音器：固定吐出語音，吐滿指定塊數後讓擷取停止。"""
-
-    def __init__(self, capture, blocks):
-        self._capture = capture
-        self._blocks = blocks
-        self._sent = 0
+    def __init__(self, blocks):
+        self._blocks = list(blocks)
 
     def __enter__(self):
         return self
@@ -102,19 +85,27 @@ class _FakeRecorder:
         return False
 
     def record(self, numframes):
-        self._sent += 1
-        if self._sent >= self._blocks:
-            self._capture._running = False   # 模擬使用者按下停止
-        return _speech(numframes / SAMPLE_RATE)
+        if self._blocks:
+            return self._blocks.pop(0)
+        import time
+        time.sleep(0.01)
+        return np.zeros((numframes, 1), dtype=np.float32)
+
+
+class _FakeMic:
+    def __init__(self, blocks):
+        self._blocks = blocks
+
+    def recorder(self, samplerate, channels):
+        return _FakeRecorder(self._blocks)
 
 
 class _FakeSpeaker:
-    name = "假喇叭"
+    name = "Fake Speaker"
 
 
 class _FakeSoundcard:
-    def __init__(self, capture, blocks):
-        self._capture = capture
+    def __init__(self, blocks):
         self._blocks = blocks
 
     def default_speaker(self):
@@ -124,22 +115,39 @@ class _FakeSoundcard:
         return [_FakeSpeaker()]
 
     def get_microphone(self, name, include_loopback=False):
-        recorder = _FakeRecorder(self._capture, self._blocks)
-        return type("Mic", (), {"recorder": lambda _s, **kw: recorder})()
+        return _FakeMic(self._blocks)
 
 
-def test_stop_flushes_pending_tail(monkeypatch):
-    """停止擷取時，最後一句還沒遇到停頓的尾段也要送出，不能整句吞掉。"""
-    from app.core import system_audio
+def test_capture_forwards_every_block(monkeypatch):
+    import time
+    blocks = [np.full((1600, 1), 0.1, dtype=np.float32),
+              np.full((1600, 1), 0.2, dtype=np.float32)]
+    monkeypatch.setitem(sys.modules, "soundcard", _FakeSoundcard(blocks))
+    got = []
+    cap = SystemAudioCapture(on_frames=lambda f: got.append(f.copy()))
+    cap.start()
+    deadline = time.monotonic() + 2.0
+    while len(got) < 2 and time.monotonic() < deadline:
+        time.sleep(0.01)
+    cap.stop()
+    assert len(got) >= 2
+    assert got[0].ndim == 1 and len(got[0]) == 1600
+    assert np.allclose(got[0], 0.1) and np.allclose(got[1], 0.2)
 
-    segments = []
-    capture = system_audio.SystemAudioCapture(on_segment=segments.append)
-    # 10 塊 × 0.1 秒 ＝ 1 秒語音：不到 max_seconds、也沒有停頓，
-    # 所以整段只會停在緩衝裡，唯有停止時的 drain 才會送出
-    monkeypatch.setitem(sys.modules, "soundcard",
-                        _FakeSoundcard(capture, blocks=10))
-    capture.start()
-    capture._thread.join(timeout=5.0)
 
-    assert len(segments) == 1, "停止時未送出尾段"
-    assert len(segments[0]) >= int(SAMPLE_RATE * 0.8)
+def test_capture_error_is_reported(monkeypatch):
+    import time
+
+    class _Broken(_FakeSoundcard):
+        def get_microphone(self, name, include_loopback=False):
+            raise RuntimeError("no loopback")
+
+    monkeypatch.setitem(sys.modules, "soundcard", _Broken([]))
+    errors = []
+    cap = SystemAudioCapture(on_error=errors.append)
+    cap.start()
+    deadline = time.monotonic() + 2.0
+    while not errors and time.monotonic() < deadline:
+        time.sleep(0.01)
+    assert errors and "no loopback" in str(errors[0])
+    assert cap.is_running is False
