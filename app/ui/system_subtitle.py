@@ -64,13 +64,10 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         header.addWidget(self.close_button)
         outer.addLayout(header)
 
-        self.original_label = QLabel("", self)
-        self.original_label.setWordWrap(True)
-        outer.addWidget(self.original_label)
-
-        self.translated_label = QLabel("", self)
-        self.translated_label.setWordWrap(True)
-        outer.addWidget(self.translated_label)
+        self.rows_layout = QVBoxLayout()
+        self.rows_layout.setSpacing(4)
+        outer.addLayout(self.rows_layout)
+        self.row_widgets = []   # [(original_label, translated_label), ...]
         outer.addStretch(1)
 
         self.history_view = QTextEdit(self)
@@ -109,14 +106,28 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         self.show()
         self.setWindowOpacity(self.target_opacity())
 
-    def show_source(self, original: str):
-        """原文先上、翻譯欄位顯示等待中；不進歷史（update_caption 才進）。"""
-        self.original_label.setText(original)
-        self.translated_label.setText("翻譯中…")
+    def set_rows(self, rows):
+        """顯示最近幾行：每行原文小字 + 翻譯大字；未完句沒翻譯時顯示「…」。"""
+        while len(self.row_widgets) < len(rows):
+            original = QLabel("", self)
+            original.setWordWrap(True)
+            translated = QLabel("", self)
+            translated.setWordWrap(True)
+            self.rows_layout.addWidget(original)
+            self.rows_layout.addWidget(translated)
+            self.row_widgets.append((original, translated))
+        while len(self.row_widgets) > len(rows):
+            original, translated = self.row_widgets.pop()
+            self.rows_layout.removeWidget(original)
+            self.rows_layout.removeWidget(translated)
+            original.deleteLater()
+            translated.deleteLater()
+        for (original, translated), row in zip(self.row_widgets, rows):
+            original.setText(row.original)
+            translated.setText(row.translated or ("…" if not row.is_final else ""))
+        self.apply_style()
 
-    def update_caption(self, original: str, translated: str):
-        self.original_label.setText(original)
-        self.translated_label.setText(translated)
+    def add_history(self, original: str, translated: str):
         self._history.append((original, translated))
         if self.history_view.isVisible():
             self._refresh_history()
@@ -130,13 +141,17 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
             self.CONFIG_SECTION, "font_size", default=20))
         original_font = QFont("Segoe UI")
         original_font.setPixelSize(max(12, round(size * 0.8)))
-        self.original_label.setFont(original_font)
-        self.original_label.setStyleSheet("color: #cfe9ef;")
         translated_font = QFont("Microsoft JhengHei")
         translated_font.setPixelSize(size)
         translated_font.setBold(True)
-        self.translated_label.setFont(translated_font)
-        self.translated_label.setStyleSheet("color: white;")
+        last = len(self.row_widgets) - 1
+        for i, (original, translated) in enumerate(self.row_widgets):
+            original.setFont(original_font)
+            translated.setFont(translated_font)
+            # 舊句淡一點，正在講的那句最亮
+            dim = i < last
+            original.setStyleSheet("color: #8fb8c2;" if dim else "color: #cfe9ef;")
+            translated.setStyleSheet("color: #d0d0d0;" if dim else "color: white;")
         self.update()
 
     # ---- 內部 ----
