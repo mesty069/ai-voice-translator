@@ -1,4 +1,6 @@
 import sys
+import threading
+import time
 from pathlib import Path
 
 import numpy as np
@@ -48,7 +50,8 @@ class _Sink:
         self.rows, self.states, self.fatals, self.finals = [], [], [], []
 
 
-def _engine(stt, translator=None, buffer=None, sink=None, mic_busy=lambda: False):
+def _engine(stt, translator=None, buffer=None, sink=None, mic_busy=lambda: False,
+            now=None, sleep=None):
     sink = sink or _Sink()
     buffer = buffer or RollingAudioBuffer()
     eng = StreamingCaptionEngine(
@@ -58,7 +61,7 @@ def _engine(stt, translator=None, buffer=None, sink=None, mic_busy=lambda: False
         on_state=lambda s, m: sink.states.append((s, m)),
         on_fatal=sink.fatals.append,
         on_final=lambda o, t: sink.finals.append((o, t)),
-        now=lambda: 0.0, sleep=lambda s: None)
+        now=now or (lambda: 0.0), sleep=sleep or (lambda s: None))
     return eng, buffer, sink
 
 
@@ -110,6 +113,7 @@ def test_completed_sentence_commits_and_advances_window():
     # 下一輪只送 committed_t 之後的音訊
     eng.step()
     assert stt.calls[-1][0] == int(SAMPLE_RATE * 2.0) - int(SAMPLE_RATE * 0.8)
+    assert stt.calls[-1][2] == 1                 # beam_size=1：串流要快
     assert abs(buf.start_seconds - 0.8) < 1e-6   # 已 trim
 
 
@@ -125,6 +129,7 @@ def test_short_final_sentence_is_translated_with_previous():
     buf.append(_speech(1.0))
     eng.step()
     assert tr.calls[-1] == "A fairly long sentence. Yes."
+    assert abs(eng.committed_t - 1.2) < 1e-6
 
 
 def test_trailing_silence_commits_current():
@@ -208,3 +213,137 @@ def test_set_display_rows_applies_next_round():
     buf.append(_speech(0.5))
     eng.step()
     assert len(sink.rows[-1]) == 2
+
+
+# ---- 修復波 1 ----
+
+class _StoppingTranslator:
+    """在 translate() 裡把引擎 stop() 掉，模擬「翻譯很慢、使用者中途關閉」。"""
+
+    def __init__(self, raise_after=None):
+        self.engine = None
+        self.calls = []
+        self.raise_after = raise_after
+
+    def translate(self, text, src, tgt, progress_cb=None):
+        self.calls.append(text)
+        self.engine.stop()
+        if self.raise_after is not None:
+            raise self.raise_after
+        return f"譯[{text}]"
+
+
+def test_short_current_committed_by_silence_uses_previous_final():
+    """A1：靜音收句的短尾句要接「前一句」，不能接到自己。"""
+    words1 = [Word("A", 0.0, 0.1), Word("fairly", 0.2, 0.4),
+              Word("long", 0.5, 0.7), Word("sentence.", 0.8, 1.0)]
+    words2 = [Word("Yes", 0.0, 0.2)]     # 沒句尾標點 → 未完句
+    stt = _ScriptedStt([words1, words2])
+    tr = _FakeTranslator()
+    eng, buf, sink = _engine(stt, tr)
+    buf.append(_speech(1.5))
+    eng.step()
+    buf.append(_silence(SILENCE_COMMIT_SEC + 0.1))
+    eng.step()
+    assert tr.calls[-1] == "A fairly long sentence. Yes"
+    assert sink.finals[-1][0] == "Yes"
+
+
+def test_pending_current_finalizes_when_stt_returns_empty():
+    """A2：辨識器對尾端靜音回空 words 時，未完句仍要收成完成句。"""
+    stt = _ScriptedStt([[Word("Hello", 0.0, 0.4)], []])
+    eng, buf, sink = _engine(stt)
+    buf.append(_speech(1.0))
+    eng.step()
+    assert sink.finals == []
+    buf.append(_silence(SILENCE_COMMIT_SEC + 0.1))
+    eng.step()
+    assert sink.finals == [("Hello", "譯[Hello]")]
+    assert sink.rows[-1][-1].is_final is True
+    assert abs(eng.committed_t - buf.total_seconds) < 1e-6
+
+
+def test_pending_current_finalized_before_dropping_stale_audio():
+    """A2：窗太長又辨識不出字而丟音訊之前，先把未完句收掉。"""
+    stt = _ScriptedStt([[Word("Talk", 0.0, 0.4)], []])
+    eng, buf, sink = _engine(stt)
+    buf.append(_speech(1.0))
+    eng.step()
+    buf.append(_speech(WINDOW_MAX_SEC + 0.5))   # 有音量 → 不是靜音路徑
+    eng.step()
+    assert sink.finals == [("Talk", "譯[Talk]")]
+    assert abs(eng.committed_t - buf.total_seconds) < 1e-6
+
+
+def test_stop_inside_translate_suppresses_final():
+    """A3：stop() 之後不得再冒出完成句回呼。"""
+    stt = _ScriptedStt([[Word("Done.", 0.0, 0.3)]])
+    tr = _StoppingTranslator()
+    eng, buf, sink = _engine(stt, tr)
+    tr.engine = eng
+    buf.append(_speech(1.0))
+    eng.step()
+    assert tr.calls == ["Done."]
+    assert sink.finals == []
+    assert sink.rows == []
+
+
+def test_stop_inside_translate_suppresses_fatal():
+    """A3：stop() 之後不得再冒出致命錯誤提示。"""
+    stt = _ScriptedStt([[Word("Done.", 0.0, 0.3)]])
+    tr = _StoppingTranslator(raise_after=ModelLoadError("no model"))
+    eng, buf, sink = _engine(stt, tr)
+    tr.engine = eng
+    buf.append(_speech(1.0))
+    eng.step()
+    assert sink.fatals == []
+    assert eng.is_running is False
+
+
+def test_stop_from_engine_thread_does_not_join_itself():
+    """致命錯誤是在引擎執行緒上回呼的，控制器會反手 stop() 引擎。"""
+    eng, buf, sink = _engine(_ScriptedStt([[]]))
+    eng._thread = threading.current_thread()
+    eng.stop()                       # 不得丟 RuntimeError
+    assert eng.is_running is False
+
+
+def test_window_overflow_commit_skips_stale_audio():
+    """A4：強制收句後窗仍過長的話，committed_t 要推到窗上限內，免得整句重來。"""
+    stt = _ScriptedStt([[Word("Endless", 0.0, 0.5), Word("talk", 0.6, 1.0)]])
+    eng, buf, sink = _engine(stt)
+    buf.append(_speech(WINDOW_MAX_SEC + 8.0))
+    eng.step()
+    assert abs(eng.committed_t - (buf.total_seconds - WINDOW_MAX_SEC)) < 1e-6
+
+
+def test_stt_wait_timeout_is_fatal():
+    """A5：語音模型久久載不起來 → 致命錯誤、引擎停掉。"""
+    stt = _ScriptedStt([[Word("x", 0.0, 0.1)]], ready=False)
+    clock = [0.0]
+
+    def now():
+        clock[0] += 5.0
+        return clock[0]
+
+    eng, buf, sink = _engine(stt, now=now)
+    eng.STT_WAIT_TIMEOUT = 4.0
+    buf.append(_speech(1.0))
+    assert eng.step() is False
+    assert sink.fatals == []
+    assert eng.step() is False
+    assert sink.fatals and "逾時" in sink.fatals[0]
+    assert eng.is_running is False
+
+
+def test_start_twice_does_not_spawn_second_thread():
+    """A6：連按兩次開始不能多起一條執行緒。"""
+    eng, buf, sink = _engine(_ScriptedStt([[]]),
+                             now=time.monotonic, sleep=time.sleep)
+    eng.start()
+    first = eng._thread
+    eng.start()
+    assert eng._thread is first
+    eng.stop()
+    first.join(1.0)
+    assert first.is_alive() is False

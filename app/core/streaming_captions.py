@@ -69,7 +69,12 @@ def split_sentences_by_words(words):
 
 
 class CaptionState:
-    """rows 與「要不要翻譯」的決策。無執行緒、無 IO，方便測試。"""
+    """rows 與「要不要翻譯」的決策。無執行緒、無 IO，方便測試。
+
+    GUI 執行緒只會呼叫 set_display_rows（單一屬性指派，CPython 的 GIL 下
+    是原子操作，最壞情況只是晚一輪生效），其餘都在引擎執行緒上，
+    因此刻意不加鎖，免得每輪辨識都要跟 GUI 搶鎖。
+    """
 
     def __init__(self, display_rows=DISPLAY_ROWS):
         self.display_rows = display_rows
@@ -91,6 +96,11 @@ class CaptionState:
     @property
     def previous_final_text(self) -> str:
         return self._finals[-1].original if self._finals else ""
+
+    @property
+    def has_current(self) -> bool:
+        """還有未收的目前句（辨識器這輪沒回字時也要看得到）。"""
+        return self._current is not None
 
     def update_current(self, text: str) -> bool:
         """更新目前句原文，回傳這一輪是否要翻譯它。"""
@@ -133,8 +143,15 @@ class CaptionState:
         self._reset_current()
         return row
 
-    def translate_input(self, text: str) -> str:
-        prev = self.previous_final_text
+    def translate_input(self, text: str, prev=None) -> str:
+        """短句翻譯時接上「前一句」當上下文。
+
+        prev 預設 None＝用目前的 previous_final_text；呼叫端若已經把 text
+        commit 進 finals（前一句就會變成 text 自己），必須傳入 commit 之前
+        取好的 prev，否則短句會被接上自己（"Yes Yes"）。
+        """
+        if prev is None:
+            prev = self.previous_final_text
         if prev and len(text) < SHORT_THRESHOLD:
             return f"{prev} {text}"
         return text
@@ -185,6 +202,8 @@ class StreamingCaptionEngine:
         return self._running
 
     def start(self):
+        if self._thread is not None and self._thread.is_alive():
+            return          # 連按兩次開始：不要多起一條執行緒
         self._running = True
         self._thread = threading.Thread(target=self._run, daemon=True,
                                         name="streaming-captions")
@@ -193,7 +212,9 @@ class StreamingCaptionEngine:
     def stop(self):
         self._running = False
         thread, self._thread = self._thread, None
-        if thread is not None:
+        # 致命錯誤的回呼是在引擎執行緒上發的，控制器會反手 stop() 引擎，
+        # 這時 join 自己會丟 RuntimeError；此時只要把旗標放掉就好。
+        if thread is not None and thread is not threading.current_thread():
             thread.join(timeout=0.1)
 
     def set_display_rows(self, n: int):
@@ -223,8 +244,10 @@ class StreamingCaptionEngine:
         try:
             return self._step()
         except ModelLoadError as e:
+            was_running = self._running
             self._running = False
-            self._on_fatal(str(e))
+            if was_running:     # 使用者已在翻譯途中 stop() → 不要再冒提示
+                self._on_fatal(str(e))
             return False
         except Exception as e:
             if self._running:
@@ -250,39 +273,46 @@ class StreamingCaptionEngine:
         window_sec = self.buffer.total_seconds - base_t
 
         # 窗太長又沒有任何句尾：把目前這串強制當一句
-        if not completed and current is not None and window_sec > WINDOW_MAX_SEC:
+        forced = not completed and current is not None and window_sec > WINDOW_MAX_SEC
+        if forced:
             completed, current = [current], None
 
         for sentence in completed:
-            # 翻譯要在 commit_text 之前算：commit_text 會把這句自己塞進
-            # finals，若先 commit 再翻，translate_input 的「前一句」就會
-            # 誤指到這句自己，短句會被錯誤地接上自己（見測試）。
-            translated = self._translate(sentence.text, spoken, native)
+            # 「前一句」要在 commit_text 之前取：commit_text 會把這句自己塞
+            # 進 finals，之後再問 previous_final_text 就會指到這句自己，
+            # 短句會被錯誤地接上自己（見測試）。
+            prev = self.state.previous_final_text
             row = self.state.commit_text(sentence.text)
             self.committed_t = base_t + sentence.end
-            row.translated = translated
-            self._on_final(sentence.text, translated)
+            row.translated = self._translate(sentence.text, spoken, native, prev)
+            if self._running:
+                self._on_final(row.original, row.translated)
         if completed:
+            if forced:
+                # 強制收句後窗可能還是過長（句尾時間戳很早），committed_t
+                # 要一併推進到窗上限內，否則下一輪會再收同一句。
+                self.committed_t = max(self.committed_t,
+                                       self.buffer.total_seconds - WINDOW_MAX_SEC)
             self.buffer.trim_before(self.committed_t)
 
-        if current is not None:
-            if self.state.update_current(current.text):
-                self.state.set_current_translation(
-                    self._translate(current.text, spoken, native))
-            # 尾端安靜夠久 → 這句講完了
-            if self.buffer.tail_peak(SILENCE_COMMIT_SEC) < MIN_PEAK:
-                row = self.state.commit_current()
-                if row is not None:
-                    if not row.translated:
-                        row.translated = self._translate(row.original, spoken, native)
-                    self._on_final(row.original, row.translated)
-                self.committed_t = self.buffer.total_seconds
-                self.buffer.trim_before(self.committed_t)
-        elif not completed:
-            # 這段音訊辨識不出字（雜音、音樂）：太長就丟掉，別一直重算
-            if window_sec > WINDOW_MAX_SEC:
-                self.committed_t = self.buffer.total_seconds
-                self.buffer.trim_before(self.committed_t)
+        if current is not None and self.state.update_current(current.text):
+            self.state.set_current_translation(
+                self._translate(current.text, spoken, native))
+
+        # 尾端安靜夠久 → 這句講完了。這裡刻意不看這輪有沒有辨識出 current：
+        # faster-whisper 對幾乎全靜音的窗會回空 words，未完句還留在 state 裡，
+        # 不在這收就永遠不會 final（會被下一句蓋掉）。
+        if (self.state.has_current
+                and self.buffer.tail_peak(SILENCE_COMMIT_SEC) < MIN_PEAK):
+            self._commit_pending(spoken, native)
+            self.committed_t = self.buffer.total_seconds
+            self.buffer.trim_before(self.committed_t)
+        elif current is None and not completed and window_sec > WINDOW_MAX_SEC:
+            # 這段音訊辨識不出字（雜音、音樂）：太長就丟掉，別一直重算；
+            # 丟之前先把未完句收掉，免得連它一起丟了。
+            self._commit_pending(spoken, native)
+            self.committed_t = self.buffer.total_seconds
+            self.buffer.trim_before(self.committed_t)
 
         if self._running:
             self._on_rows(self.state.rows)
@@ -290,7 +320,18 @@ class StreamingCaptionEngine:
 
     # ---- 輔助 ----
 
-    def _translate(self, text: str, spoken: str, native: str) -> str:
+    def _commit_pending(self, spoken: str, native: str):
+        """把未收的目前句當完成句收掉（靜音、或要丟掉這段音訊之前）。"""
+        prev = self.state.previous_final_text
+        row = self.state.commit_current()
+        if row is None:
+            return
+        if not row.translated:
+            row.translated = self._translate(row.original, spoken, native, prev)
+        if self._running:
+            self._on_final(row.original, row.translated)
+
+    def _translate(self, text: str, spoken: str, native: str, prev=None) -> str:
         announced = []
 
         def progress(message):
@@ -298,7 +339,7 @@ class StreamingCaptionEngine:
                 announced.append(True)
                 self._on_state("loading", message)
 
-        result = self.translator.translate(self.state.translate_input(text),
+        result = self.translator.translate(self.state.translate_input(text, prev),
                                            spoken, native, progress_cb=progress)
         if announced and self._running:
             self._on_state("listening", "正在聽系統聲音…")

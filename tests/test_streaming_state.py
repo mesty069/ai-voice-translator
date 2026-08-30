@@ -147,3 +147,21 @@ def test_rows_returns_copies():
     st.update_current("a")
     st.rows[0].original = "mutated"
     assert st.rows[0].original == "a"
+
+
+def test_translate_input_accepts_explicit_previous():
+    """A1：引擎在 commit 之前先取「前一句」，commit 之後才用它來翻譯。"""
+    st = CaptionState()
+    st.commit_text("Previous sentence here.")
+    assert st.translate_input("Yes.", prev="Earlier one.") == "Earlier one. Yes."
+    assert st.translate_input("Yes.", prev="") == "Yes."
+
+
+def test_has_current_tracks_pending_row():
+    """A2：辨識器這輪沒回字時，引擎仍要知道有未完句待收。"""
+    st = CaptionState()
+    assert st.has_current is False
+    st.update_current("partial")
+    assert st.has_current is True
+    st.commit_current()
+    assert st.has_current is False
