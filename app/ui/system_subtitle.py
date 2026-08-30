@@ -1,3 +1,5 @@
+import html
+
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QTextCursor
 from PySide6.QtWidgets import (
@@ -10,7 +12,12 @@ from PySide6.QtWidgets import (
 
 from qfluentwidgets import FluentIcon, Theme, TransparentToolButton
 
-from ..core.streaming_captions import DISPLAY_ROWS
+from ..core.streaming_captions import (
+    DISPLAY_ROWS,
+    VERYLONG_THRESHOLD,
+    join_words,
+    shorten_display_sentence,
+)
 from .overlay_base import DraggableResizableOverlay
 
 _FLAGS = (Qt.WindowType.FramelessWindowHint
@@ -20,11 +27,21 @@ _FLAGS = (Qt.WindowType.FramelessWindowHint
 
 DEFAULT_BG = "#0d2b33"
 ACCENT = "#4dd0e1"      # 青色，與麥克風字幕（深灰白字）明顯區分
+DIM_TEXT = "#d0d0d0"    # 前幾句翻譯（照 OverlayWindow.xaml）
+ACTIVE_TEXT = "#ffffff"  # 正在講的那句翻譯
+ORIGINAL_TEXT = "#cfe9ef"   # 下方當前句原文
 MIN_SIZE = QSize(360, 130)
 
 
+def _separator(left: str, right: str) -> str:
+    """兩段文字之間該不該有空白（沿用 join_words 的中日韓規則）。"""
+    if not left or not right:
+        return ""
+    return join_words([left, right])[len(left):-len(right)]
+
+
 class SystemSubtitleOverlay(DraggableResizableOverlay):
-    """系統聲音的雙語字幕：上行原文、下行母語翻譯。
+    """系統聲音的雙語字幕：上方翻譯段落、下方當前句原文（照 OverlayWindow.xaml）。
 
     與麥克風字幕的差異：青藍配色、左上角「🔊 系統聲音」標籤、
     不會自動倒數消失（停止擷取才收起）、可展開本次逐字稿。
@@ -39,6 +56,7 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setMinimumSize(MIN_SIZE)
         self._history = []
+        self._rows_shown = 0    # 上次 set_rows 的列數（重算高度用）
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(20, 10, 12, 16)
@@ -67,8 +85,16 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
 
         self.rows_layout = QVBoxLayout()
         self.rows_layout.setSpacing(4)
+        # 上：翻譯段落（前幾句較淡 + 當前句白色，rich text 上色）
+        self.translation_label = QLabel("", self)
+        self.translation_label.setWordWrap(True)
+        self.translation_label.setTextFormat(Qt.TextFormat.RichText)
+        self.rows_layout.addWidget(self.translation_label)
+        # 下：當前句原文
+        self.original_label = QLabel("", self)
+        self.original_label.setWordWrap(True)
+        self.rows_layout.addWidget(self.original_label)
         outer.addLayout(self.rows_layout)
-        self.row_widgets = []   # [(原文 QLabel, 翻譯 QLabel), ...]
         outer.addStretch(1)
 
         self.history_view = QTextEdit(self)
@@ -85,7 +111,7 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
     # ---- 對外 API ----
 
     def preferred_height(self, rows: int) -> int:
-        """放得下 rows 行（每行原文小字 + 翻譯大字）所需的高度。
+        """放得下 rows 句（翻譯大字 + 原文小字）所需的高度估值。
 
         MIN_SIZE 的 130px 是為兩個 label 設計的，三行會被裁掉，所以依
         字級估：標頭 30 + 每行（0.8×字級 原文 + 字級 翻譯 + 行距 12）
@@ -109,8 +135,8 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
             height = max(size[1], MIN_SIZE.height())
         else:
             width = max(min(int(geo.width() * 0.5), 780), MIN_SIZE.width())
-            height = self.preferred_height(self.config.get(
-                self.CONFIG_SECTION, "display_rows", default=DISPLAY_ROWS))
+            height = self.preferred_height(1 + int(self.config.get(
+                self.CONFIG_SECTION, "display_rows", default=DISPLAY_ROWS)))
         self.resize(width, height)
         if pos is not None:
             self.move(pos)
@@ -122,24 +148,31 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         self.setWindowOpacity(self.target_opacity())
 
     def set_rows(self, rows):
-        """顯示最近幾行：每行原文小字 + 翻譯大字；未完句沒翻譯時顯示「…」。"""
-        while len(self.row_widgets) < len(rows):
-            original = QLabel("", self)
-            original.setWordWrap(True)
-            translated = QLabel("", self)
-            translated.setWordWrap(True)
-            self.rows_layout.addWidget(original)
-            self.rows_layout.addWidget(translated)
-            self.row_widgets.append((original, translated))
-        while len(self.row_widgets) > len(rows):
-            original, translated = self.row_widgets.pop()
-            self.rows_layout.removeWidget(original)
-            self.rows_layout.removeWidget(translated)
-            original.deleteLater()
-            translated.deleteLater()
-        for (original, translated), row in zip(self.row_widgets, rows):
-            original.setText(row.original)
-            translated.setText(row.translated or ("…" if not row.is_final else ""))
+        """上方把所有翻譯接成一段（前幾句較淡、當前句白色），下方放當前句原文。
+
+        當前句還沒翻好時就只顯示前幾句，不補「…」（照 LiveCaptions-Translator：
+        翻譯是一段連續的文字，佔位符會讓它一直跳動）。
+        """
+        self._rows_shown = len(rows)
+        if not rows:
+            self.translation_label.setText("")
+            self.original_label.setText("")
+            self.apply_style()
+            self._fit_height(0)
+            return
+        previous = join_words([r.translated for r in rows[:-1] if r.translated])
+        current = rows[-1].translated
+        parts = []
+        if previous:
+            parts.append(f'<span style="color: {DIM_TEXT}">'
+                         f'{html.escape(previous)}</span>')
+        if current:
+            parts.append(_separator(previous, current))
+            parts.append(f'<span style="color: {ACTIVE_TEXT}">'
+                         f'{html.escape(current)}</span>')
+        self.translation_label.setText("".join(parts))
+        self.original_label.setText(
+            shorten_display_sentence(rows[-1].original, VERYLONG_THRESHOLD))
         self.apply_style()   # 先套字型，量高度才準
         self._fit_height(len(rows))
 
@@ -154,7 +187,7 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         margins = self.layout().contentsMargins()
         label_width = max(50, self.width() - margins.left() - margins.right())
         header_h = max(22, self.tag_label.sizeHint().height())
-        labels = [lbl for pair in self.row_widgets for lbl in pair]
+        labels = [self.translation_label, self.original_label]
         text_h = sum(lbl.heightForWidth(label_width) for lbl in labels)
         gaps = self.rows_layout.spacing() * max(0, len(labels) - 1)
         needed = (margins.top() + header_h + self.layout().spacing()
@@ -172,8 +205,9 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         # 拉窄後文字會多折幾行，需求高度變了要重算
-        if event.oldSize().width() != event.size().width() and self.row_widgets:
-            self._fit_height(len(self.row_widgets))
+        if (event.oldSize().width() != event.size().width()
+                and getattr(self, "_rows_shown", 0)):
+            self._fit_height(self._rows_shown)
 
     def add_history(self, original: str, translated: str):
         # 短句併進前一句時會再送一次「合併後的整句」：直接取代上一筆，
@@ -198,14 +232,11 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         translated_font = QFont("Microsoft JhengHei")
         translated_font.setPixelSize(size)
         translated_font.setBold(True)
-        last = len(self.row_widgets) - 1
-        for i, (original, translated) in enumerate(self.row_widgets):
-            original.setFont(original_font)
-            translated.setFont(translated_font)
-            # 舊句淡一點，正在講的那句最亮
-            dim = i < last
-            original.setStyleSheet("color: #8fb8c2;" if dim else "color: #cfe9ef;")
-            translated.setStyleSheet("color: #d0d0d0;" if dim else "color: white;")
+        self.translation_label.setFont(translated_font)
+        # 段落裡各句的顏色由 set_rows 的 <span> 決定，這裡只給預設色
+        self.translation_label.setStyleSheet(f"color: {ACTIVE_TEXT};")
+        self.original_label.setFont(original_font)
+        self.original_label.setStyleSheet(f"color: {ORIGINAL_TEXT};")
         self.update()
 
     # ---- 內部 ----

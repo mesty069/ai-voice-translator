@@ -237,8 +237,8 @@ class SettingsInterface(ScrollArea):
         self._add_row(layout, "翻譯運算裝置", self.system_compute_combo)
         self.system_rows_spin = SpinBox(self.view)
         self.system_rows_spin.setRange(1, 5)
-        self.system_rows_spin.setSuffix(" 行")
-        self._add_row(layout, "同時顯示幾行（最近幾句 + 正在講的這句）",
+        self.system_rows_spin.setSuffix(" 句")
+        self._add_row(layout, "保留前幾句翻譯（它們會接在正在講這句的前面）",
                       self.system_rows_spin)
         self.system_font_spin = SpinBox(self.view)
         self.system_font_spin.setRange(12, 48)

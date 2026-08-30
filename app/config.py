@@ -107,7 +107,7 @@ DEFAULT_CONFIG = {
         "font_size": 20,
         "opacity": 100,
         "bg_color": "#0d2b33",
-        "display_rows": 3,        # 疊加層同時顯示幾行（最近 N-1 句 + 正在講的這句）
+        "display_rows": 3,        # 疊加層保留前幾句翻譯（另外還會顯示正在講的這句）
     },
     "ui": {
         "theme": "auto",
