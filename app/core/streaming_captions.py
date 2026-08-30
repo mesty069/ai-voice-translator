@@ -318,7 +318,9 @@ class StreamingCaptionEngine:
                 next_start = current.start
             else:
                 next_start = sentence.end
-            self.committed_t = base_t + next_start
+            # Whisper 偶爾給出重疊的字時間戳（下一個字的 start 早於這句的 end），
+            # 不能讓 committed_t 倒退，否則這句會被再辨識、再 commit 一次
+            self.committed_t = base_t + max(next_start, sentence.end)
             if self._running:
                 self._on_final(row.original, row.translated)
         if completed:
