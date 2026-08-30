@@ -120,7 +120,8 @@ def test_completed_sentence_commits_and_advances_window():
     assert abs(buf.start_seconds - 1.2) < 1e-6   # 已 trim
 
 
-def test_short_final_sentence_is_translated_with_previous():
+def test_short_final_sentence_merges_into_previous_row():
+    """短的完成句要被併進前一列（原文與翻譯都是合併後的整句），不另起一列。"""
     words1 = [Word("A", 0.0, 0.1), Word("fairly", 0.2, 0.4), Word("long", 0.5, 0.7),
               Word("sentence.", 0.8, 1.0)]
     words2 = [Word("Yes.", 0.0, 0.2)]
@@ -131,8 +132,33 @@ def test_short_final_sentence_is_translated_with_previous():
     eng.step()
     buf.append(_speech(1.0))
     eng.step()
-    assert tr.calls[-1] == "A fairly long sentence. Yes."
+    merged = "A fairly long sentence. Yes."
+    assert tr.calls[-1] == merged
+    rows = eng.state.rows
+    assert len(rows) == 1
+    assert rows[0].original == merged
+    assert rows[0].translated == f"譯[{merged}]"
+    assert rows[0].is_final is True
+    # 歷史每收一次句就記一次：合併前那句也還在歷史裡（照 reference 的行為）
+    assert len(sink.finals) == 2
+    assert sink.finals[-1] == (merged, f"譯[{merged}]")
     assert abs(eng.committed_t - 1.2) < 1e-6
+
+
+def test_short_current_sentence_is_translated_alone():
+    """未完的目前句一律只翻自己，不接前一句（否則會冒出「別見你。- .」這種東西）。"""
+    words1 = [Word("A", 0.0, 0.1), Word("fairly", 0.2, 0.4), Word("long", 0.5, 0.7),
+              Word("sentence.", 0.8, 1.0)]
+    words2 = [Word("Now", 0.0, 0.2)]
+    stt = _ScriptedStt([words1, words2])
+    tr = _FakeTranslator()
+    eng, buf, sink = _engine(stt, tr)
+    buf.append(_speech(1.5))
+    eng.step()
+    for _ in range(IDLE_ROUNDS + 1):
+        buf.append(_speech(1.0))
+        eng.step()
+    assert tr.calls == ["A fairly long sentence.", "Now"]
 
 
 def test_trailing_silence_commits_current():
@@ -206,8 +232,10 @@ def test_stop_makes_callbacks_inert():
 
 
 def test_set_display_rows_applies_next_round():
-    stt = _ScriptedStt([[Word("One.", 0.0, 0.2), Word("Two.", 0.3, 0.5),
-                         Word("Three.", 0.6, 0.8), Word("Four", 0.9, 1.0)]])
+    # 三句都刻意寫長，免得被短句合併規則併成一列
+    stt = _ScriptedStt([[Word("Alphabetical.", 0.0, 0.2),
+                         Word("Beautifully.", 0.3, 0.5),
+                         Word("Coordinated.", 0.6, 0.8), Word("Four", 0.9, 1.0)]])
     eng, buf, sink = _engine(stt)
     buf.append(_speech(1.5))
     eng.step()
@@ -236,8 +264,8 @@ class _StoppingTranslator:
         return f"譯[{text}]"
 
 
-def test_short_current_committed_by_silence_uses_previous_final():
-    """A1：靜音收句的短尾句要接「前一句」，不能接到自己。"""
+def test_short_current_committed_by_silence_merges_into_previous_row():
+    """A1：靜音收掉的短尾句一樣併進前一列，不能接到自己、也不另起一列。"""
     words1 = [Word("A", 0.0, 0.1), Word("fairly", 0.2, 0.4),
               Word("long", 0.5, 0.7), Word("sentence.", 0.8, 1.0)]
     words2 = [Word("Yes", 0.0, 0.2)]     # 沒句尾標點 → 未完句
@@ -248,8 +276,14 @@ def test_short_current_committed_by_silence_uses_previous_final():
     eng.step()
     buf.append(_silence(SILENCE_COMMIT_SEC + 0.1))
     eng.step()
-    assert tr.calls[-1] == "A fairly long sentence. Yes"
-    assert sink.finals[-1][0] == "Yes"
+    merged = "A fairly long sentence. Yes"
+    assert tr.calls[-1] == merged
+    assert sink.finals[-1] == (merged, f"譯[{merged}]")
+    rows = eng.state.rows
+    assert len(rows) == 1
+    assert rows[0].original == merged
+    assert rows[0].translated == f"譯[{merged}]"
+    assert rows[0].is_final is True
 
 
 def test_pending_current_finalizes_when_stt_returns_empty():

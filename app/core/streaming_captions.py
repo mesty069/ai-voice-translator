@@ -11,7 +11,7 @@ from dataclasses import dataclass, replace
 from .local_translate import ModelLoadError
 
 PUNC_EOS = ".?!。？！"
-SHORT_THRESHOLD = 10       # 目前句短於此 → 翻譯時接前一句
+SHORT_THRESHOLD = 10       # 完成句短於此（UTF-8 位元組）→ 併進前一句
 MEDIUM_THRESHOLD = 40      # 文字變了且長於此 → 立即重翻
 WINDOW_MAX_SEC = 12.0      # 開放音訊窗上限
 POLL_SEC = 1.0             # 兩輪辨識的最小間隔
@@ -137,35 +137,60 @@ class CaptionState:
             self._current.translated = translated
             self._last_translated = self._current.original
 
+    @staticmethod
+    def is_short(text: str) -> bool:
+        """照 LiveCaptions-Translator 的 TextUtil：門檻算 UTF-8 位元組數。
+
+        所以中日韓大約 3 個字以內算短句，英文則是 10 個字元以內。
+        """
+        return len(text.encode("utf-8")) < SHORT_THRESHOLD
+
+    def commit_target(self, text: str) -> str:
+        """這句收下去之後那一列的原文。
+
+        短句會被併進前一句：合併後的整句才是要顯示、也才是要送去翻譯的
+        文字（reference 的 Translator.cs 就是這樣接前一句的）。
+        """
+        prev = self.previous_final_text
+        if prev and self.is_short(text):
+            return join_words([prev, text])
+        return text
+
     def commit_text(self, text: str) -> Row:
-        """辨識器已判定完成的句子：進 finals，目前句清空。"""
-        row = Row(text, "", True)
-        self._finals.append(row)
+        """辨識器已判定完成的句子：進 finals，目前句清空。
+
+        短句不另起一列，而是就地改寫前一列（回傳的就是那一列），不然前一句
+        的翻譯會在畫面上出現兩次（自己一列、合併句又一列）。
+        """
+        target = self.commit_target(text)
+        if self._finals and target != text:
+            row = self._finals[-1]
+            row.original = target
+            row.translated = ""      # 呼叫端會補上合併後整句的翻譯
+        else:
+            row = Row(text, "", True)
+            self._finals.append(row)
         self._reset_current()
         return row
 
     def commit_current(self):
-        """把目前句直接當完成句（靜音／窗超長），保留已有翻譯。"""
+        """把目前句直接當完成句（靜音／窗超長），保留已有翻譯。
+
+        一樣套短句合併規則：短的尾句併進前一列，目前句本身就丟掉。
+        """
         if self._current is None:
             return None
-        row = self._current
-        row.is_final = True
-        self._finals.append(row)
+        target = self.commit_target(self._current.original)
+        if self._finals and target != self._current.original:
+            row = self._finals[-1]
+            row.original = target
+            row.translated = ""      # 呼叫端會補上合併後整句的翻譯
+        else:
+            row = self._current
+            row.is_final = True
+            self._finals.append(row)
         self._reset_current()
         return row
-
-    def translate_input(self, text: str, prev=None) -> str:
-        """短句翻譯時接上「前一句」當上下文。
-
-        prev 預設 None＝用目前的 previous_final_text；呼叫端若已經把 text
-        commit 進 finals（前一句就會變成 text 自己），必須傳入 commit 之前
-        取好的 prev，否則短句會被接上自己（"Yes Yes"）。
-        """
-        if prev is None:
-            prev = self.previous_final_text
-        if prev and len(text) < SHORT_THRESHOLD:
-            return f"{prev} {text}"
-        return text
 
     def _reset_current(self):
         self._current = None
@@ -301,11 +326,11 @@ class StreamingCaptionEngine:
         for i, sentence in enumerate(completed):
             # 先翻譯、再 commit：翻譯丟例外時這一輪什麼都沒動（句子沒進
             # finals、committed_t 沒推進），同一段音訊下一輪會整句重來。
-            # 「前一句」也要在 commit_text 之前取：commit_text 會把這句自己
-            # 塞進 finals，之後再問 previous_final_text 就會指到這句自己，
-            # 短句會被錯誤地接上自己（見測試）。
-            prev = self.state.previous_final_text
-            translated = self._translate(sentence.text, spoken, native, prev=prev)
+            # target 也要在 commit_text 之前取：短句會被併進前一列，合併後
+            # 的整句才是這一列的原文，也才是要送去翻譯的文字；commit_text
+            # 之後再問就會指到合併完的自己。
+            target = self.state.commit_target(sentence.text)
+            translated = self._translate(target, spoken, native)
             row = self.state.commit_text(sentence.text)
             row.translated = translated
             # 推進到「下一個還沒收的字」的起點，而不是這句最後一個字的
@@ -321,6 +346,8 @@ class StreamingCaptionEngine:
             # Whisper 偶爾給出重疊的字時間戳（下一個字的 start 早於這句的 end），
             # 不能讓 committed_t 倒退，否則這句會被再辨識、再 commit 一次
             self.committed_t = base_t + max(next_start, sentence.end)
+            # 短句合併時歷史會同時留著「合併前那句」與「合併後的整句」，
+            # 這是 reference 的紀錄行為，刻意不去回頭改寫上一筆歷史。
             if self._running:
                 self._on_final(row.original, row.translated)
         if completed:
@@ -365,16 +392,17 @@ class StreamingCaptionEngine:
         pending = self.state.current_row
         if pending is None:
             return
+        # 併進前一列的話，這一列的原文變成合併後的整句，既有的翻譯就不能用了
+        target = self.state.commit_target(pending.original)
         translated = pending.translated
-        if not translated:
-            translated = self._translate(pending.original, spoken, native,
-                                         prev=self.state.previous_final_text)
+        if target != pending.original or not translated:
+            translated = self._translate(target, spoken, native)
         row = self.state.commit_current()
         row.translated = translated
         if self._running:
             self._on_final(row.original, row.translated)
 
-    def _translate(self, text: str, spoken: str, native: str, prev=None) -> str:
+    def _translate(self, text: str, spoken: str, native: str) -> str:
         announced = []
 
         def progress(message):
@@ -382,8 +410,8 @@ class StreamingCaptionEngine:
                 announced.append(True)
                 self._on_state("loading", message)
 
-        result = self.translator.translate(self.state.translate_input(text, prev),
-                                           spoken, native, progress_cb=progress)
+        result = self.translator.translate(text, spoken, native,
+                                           progress_cb=progress)
         if announced and self._running:
             self._on_state("listening", "正在聽系統聲音…")
         return result

@@ -106,18 +106,20 @@ def test_translation_kept_while_text_grows():
 
 
 def test_commit_text_pushes_rows_and_caps_display():
+    # 句子都刻意寫長（>= SHORT_THRESHOLD 位元組），免得被短句合併規則併成一列
     st = CaptionState(display_rows=3)
     st.update_current("partial")
-    r1 = st.commit_text("One.")
-    r1.translated = "一。"
-    assert st.rows == [Row("One.", "一。", True)]     # current 清掉了
-    st.commit_text("Two.")
-    st.commit_text("Three.")
-    st.commit_text("Four.")
+    r1 = st.commit_text("Sentence one.")
+    r1.translated = "第一句。"
+    assert st.rows == [Row("Sentence one.", "第一句。", True)]     # current 清掉了
+    st.commit_text("Sentence two.")
+    st.commit_text("Sentence three.")
+    st.commit_text("Sentence four.")
     st.update_current("Five")
-    assert [r.original for r in st.rows] == ["Three.", "Four.", "Five"]
+    assert [r.original for r in st.rows] == [
+        "Sentence three.", "Sentence four.", "Five"]
     st.set_display_rows(2)
-    assert [r.original for r in st.rows] == ["Four.", "Five"]
+    assert [r.original for r in st.rows] == ["Sentence four.", "Five"]
 
 
 def test_commit_current_keeps_translation():
@@ -130,16 +132,60 @@ def test_commit_current_keeps_translation():
     assert st.commit_current() is None
 
 
-def test_translate_input_prepends_previous_for_short_text():
+def test_is_short_counts_utf8_bytes():
+    """照 LiveCaptions-Translator：門檻是 UTF-8 位元組數，中日韓約 3 個字。"""
+    assert CaptionState.is_short("Yes.") is True
+    assert CaptionState.is_short("x" * SHORT_THRESHOLD) is False
+    assert len("你好".encode("utf-8")) < SHORT_THRESHOLD
+    assert CaptionState.is_short("你好") is True
+    assert len("你好嗎？".encode("utf-8")) >= SHORT_THRESHOLD
+    assert CaptionState.is_short("你好嗎？") is False
+    assert CaptionState.is_short("") is True
+
+
+def test_commit_target_merges_short_text_with_previous_final():
+    st = CaptionState()
+    assert st.commit_target("Yes.") == "Yes."          # 還沒有前一句
+    st.commit_text("Previous sentence here.")
+    assert st.commit_target("Yes.") == "Previous sentence here. Yes."
+    assert st.commit_target("x" * SHORT_THRESHOLD) == "x" * SHORT_THRESHOLD
+
+
+def test_commit_target_uses_join_words_for_cjk():
+    st = CaptionState()
+    st.commit_text("這是前面一句話。")
+    assert st.commit_target("好。") == "這是前面一句話。好。"
+
+
+def test_commit_text_merges_short_sentence_into_previous_row():
+    """短句要併進前一列，不能自己另起一列（否則前一句的翻譯會出現兩次）。"""
+    st = CaptionState()
+    first = st.commit_text("Previous sentence here.")
+    first.translated = "前面那句。"
+    merged = st.commit_text("Yes.")
+    assert merged is first                     # 同一個 Row 物件被就地改寫
+    assert len(st.rows) == 1
+    assert st.rows[0] == Row("Previous sentence here. Yes.", "", True)
+
+
+def test_commit_text_does_not_merge_long_sentence():
     st = CaptionState()
     st.commit_text("Previous sentence here.")
-    short = "x" * (SHORT_THRESHOLD - 1)
-    assert st.translate_input(short) == "Previous sentence here. " + short
-    assert st.translate_input("x" * SHORT_THRESHOLD) == "x" * SHORT_THRESHOLD
+    st.commit_text("Another long sentence.")
+    assert [r.original for r in st.rows] == [
+        "Previous sentence here.", "Another long sentence."]
 
 
-def test_translate_input_without_previous_is_unchanged():
-    assert CaptionState().translate_input("ok") == "ok"
+def test_commit_current_merges_short_pending_into_previous_row():
+    st = CaptionState()
+    st.commit_text("Previous sentence here.")
+    st.update_current("Yes")
+    st.set_current_translation("是")
+    row = st.commit_current()
+    assert row.original == "Previous sentence here. Yes"
+    assert row.is_final is True
+    assert st.rows == [Row("Previous sentence here. Yes", "", True)]
+    assert st.has_current is False
 
 
 def test_rows_returns_copies():
@@ -147,14 +193,6 @@ def test_rows_returns_copies():
     st.update_current("a")
     st.rows[0].original = "mutated"
     assert st.rows[0].original == "a"
-
-
-def test_translate_input_accepts_explicit_previous():
-    """A1：引擎在 commit 之前先取「前一句」，commit 之後才用它來翻譯。"""
-    st = CaptionState()
-    st.commit_text("Previous sentence here.")
-    assert st.translate_input("Yes.", prev="Earlier one.") == "Earlier one. Yes."
-    assert st.translate_input("Yes.", prev="") == "Yes."
 
 
 def test_has_current_tracks_pending_row():
