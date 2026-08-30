@@ -102,6 +102,15 @@ class CaptionState:
         """還有未收的目前句（辨識器這輪沒回字時也要看得到）。"""
         return self._current is not None
 
+    @property
+    def current_row(self):
+        """目前句的複本（沒有就 None）。
+
+        引擎要在 commit_current() 之前先讀原文與既有翻譯：翻譯失敗時這句
+        還留在目前句裡，下一輪可以整句重來。
+        """
+        return replace(self._current) if self._current is not None else None
+
     def update_current(self, text: str) -> bool:
         """更新目前句原文，回傳這一輪是否要翻譯它。"""
         if self._current is None:
@@ -278,13 +287,16 @@ class StreamingCaptionEngine:
             completed, current = [current], None
 
         for sentence in completed:
-            # 「前一句」要在 commit_text 之前取：commit_text 會把這句自己塞
-            # 進 finals，之後再問 previous_final_text 就會指到這句自己，
+            # 先翻譯、再 commit：翻譯丟例外時這一輪什麼都沒動（句子沒進
+            # finals、committed_t 沒推進），同一段音訊下一輪會整句重來。
+            # 「前一句」也要在 commit_text 之前取：commit_text 會把這句自己
+            # 塞進 finals，之後再問 previous_final_text 就會指到這句自己，
             # 短句會被錯誤地接上自己（見測試）。
             prev = self.state.previous_final_text
+            translated = self._translate(sentence.text, spoken, native, prev=prev)
             row = self.state.commit_text(sentence.text)
+            row.translated = translated
             self.committed_t = base_t + sentence.end
-            row.translated = self._translate(sentence.text, spoken, native, prev)
             if self._running:
                 self._on_final(row.original, row.translated)
         if completed:
@@ -321,13 +333,20 @@ class StreamingCaptionEngine:
     # ---- 輔助 ----
 
     def _commit_pending(self, spoken: str, native: str):
-        """把未收的目前句當完成句收掉（靜音、或要丟掉這段音訊之前）。"""
-        prev = self.state.previous_final_text
-        row = self.state.commit_current()
-        if row is None:
+        """把未收的目前句當完成句收掉（靜音、或要丟掉這段音訊之前）。
+
+        一樣先翻譯、再 commit：翻譯丟例外時這句還是目前句，呼叫端的
+        committed_t／trim 也跟著不會動，下一輪原封不動再收一次。
+        """
+        pending = self.state.current_row
+        if pending is None:
             return
-        if not row.translated:
-            row.translated = self._translate(row.original, spoken, native, prev)
+        translated = pending.translated
+        if not translated:
+            translated = self._translate(pending.original, spoken, native,
+                                         prev=self.state.previous_final_text)
+        row = self.state.commit_current()
+        row.translated = translated
         if self._running:
             self._on_final(row.original, row.translated)
 

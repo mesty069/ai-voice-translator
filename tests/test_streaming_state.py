@@ -165,3 +165,15 @@ def test_has_current_tracks_pending_row():
     assert st.has_current is True
     st.commit_current()
     assert st.has_current is False
+
+
+def test_current_row_is_a_copy_of_the_pending_row():
+    """F1：引擎要在 commit 之前先讀目前句（翻譯失敗時原句才留得住）。"""
+    st = CaptionState()
+    assert st.current_row is None
+    st.update_current("Trailing")
+    st.set_current_translation("尾句")
+    row = st.current_row
+    assert row == Row("Trailing", "尾句", False)
+    row.original = "mutated"
+    assert st.current_row.original == "Trailing"

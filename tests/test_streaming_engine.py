@@ -347,3 +347,60 @@ def test_start_twice_does_not_spawn_second_thread():
     eng.stop()
     first.join(1.0)
     assert first.is_alive() is False
+
+
+# ---- 修復波 2 ----
+
+class _FlakyTranslator:
+    """前 N 次呼叫丟例外，之後正常翻譯（模擬短暫的 GPU／記憶體錯誤）。"""
+
+    def __init__(self, fail_times=1, error=None):
+        self.calls = []
+        self.remaining_failures = fail_times
+        self.error = error or RuntimeError("cuda oom")
+
+    def translate(self, text, src, tgt, progress_cb=None):
+        if self.remaining_failures > 0:
+            self.remaining_failures -= 1
+            raise self.error
+        self.calls.append(text)
+        return f"譯[{text}]"
+
+
+def test_completed_sentence_is_retried_when_translation_fails():
+    """F1：翻譯失敗不得留下空翻譯的完成句，也不得推進 committed_t。"""
+    stt = _ScriptedStt([[Word("Hello", 0.0, 0.3), Word("there.", 0.4, 0.8)]])
+    tr = _FlakyTranslator()
+    eng, buf, sink = _engine(stt, tr)
+    buf.append(_speech(1.0))
+    eng.step()
+    assert sink.finals == []
+    assert eng.state.rows == []                  # 沒有半成品的完成句
+    assert abs(eng.committed_t) < 1e-6           # 音訊還在，下一輪重來
+    assert sink.states[-1][0] == "error"
+    assert sink.rows == []
+    eng.step()                                   # 這次翻譯正常
+    assert sink.finals == [("Hello there.", "譯[Hello there.]")]
+    assert [r.original for r in eng.state.rows] == ["Hello there."]
+    assert abs(eng.committed_t - 0.8) < 1e-6
+
+
+def test_pending_sentence_is_retried_when_translation_fails():
+    """F1：靜音收句時翻譯失敗 → 未完句留著，下一輪再收一次（不重複）。"""
+    stt = _ScriptedStt([[Word("Trailing", 0.0, 0.4)], []])
+    tr = _FlakyTranslator()
+    eng, buf, sink = _engine(stt, tr)
+    buf.append(_speech(1.0))
+    eng.step()
+    assert tr.calls == []                        # 還沒到翻譯門檻
+    buf.append(_silence(SILENCE_COMMIT_SEC + 0.1))
+    eng.step()
+    assert sink.finals == []
+    assert eng.state.rows[-1].original == "Trailing"
+    assert eng.state.rows[-1].is_final is False  # 還是目前句
+    assert abs(eng.committed_t) < 1e-6
+    assert sink.states[-1][0] == "error"
+    eng.step()                                   # 這次翻譯正常
+    assert sink.finals == [("Trailing", "譯[Trailing]")]
+    assert eng.state.rows[-1].is_final is True
+    assert abs(eng.committed_t - buf.total_seconds) < 1e-6
