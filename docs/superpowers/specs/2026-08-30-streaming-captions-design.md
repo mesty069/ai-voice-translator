@@ -96,3 +96,56 @@ StreamingCaptionEngine（worker 執行緒，每 POLL_SEC 一輪）        │
 - 不改麥克風翻譯管線與其字幕。
 - 不引入 torch／任何新的重量級依賴。
 - 不做 LLM 上下文翻譯（DeepSeek 不用於系統字幕，維持原決定）。
+
+## 2026-08-30 對齊 LiveCaptions-Translator（除翻譯引擎）
+
+參考 `src/Translator.cs`（SyncLoop）、`src/windows/OverlayWindow.xaml`、`src/utils/TextUtil.cs`。
+
+### 觸發時序（`app/core/streaming_captions.py`）
+
+它每 25ms 讀一次系統字幕，所以用「輪數」計時；我們每一輪要跑一次 Whisper
+（0.3–0.8 秒），輪數不可比，因此把 idle 改成用**時間**判斷，其餘照搬：
+
+- 原文停住 `IDLE_SEC` 沒變 → 翻（對應它的 `MaxIdleInterval` 50 × 25ms = 1.25 秒）。
+- 原文變了且不算短句（UTF-8 位元組 ≥ `SHORT_THRESHOLD`）→ `_sync_count += 1`；
+  `_sync_count > MAX_SYNC` → 翻並歸零（對應 `MaxSyncInterval`）。
+- 以句尾標點結尾 → 立刻翻並歸零。
+- idle 這條**不**歸零 `_sync_count`（照它的寫法）。
+- 相同原文不重翻（`_last_translated`），這點比它嚴格，刻意保留。
+- `CaptionState.update_current(text, now)` 多接一個時間參數，引擎傳 `self._now()`，
+  測試可注入可推進的假時鐘。
+
+### 新的常數表
+
+| 名稱 | 值 | 意義 |
+|---|---|---|
+| `POLL_SEC` | 0.5 | 兩輪辨識的最小間隔（上一輪沒跑完不開新的） |
+| `IDLE_SEC` | 1.25 | 原文停住這麼久就翻（取代 `IDLE_ROUNDS`） |
+| `MAX_SYNC` | 3 | 原文變動次數超過此值就翻並歸零（短句不計） |
+| `VERYLONG_THRESHOLD` | 220（UTF-8 位元組） | 疊加層顯示原文的上限，超過就從頭截 |
+| `PUNC_COMMA` | `",，、—\n"` | `shorten_display_sentence` 的截斷點 |
+| `SHORT_THRESHOLD` | 10（UTF-8 位元組） | 不變：短的完成句併進前一列；短句不計 sync |
+| `DISPLAY_ROWS` | 3 | 改為「保留前幾句翻譯」，`rows` 回傳 `display_rows + 1` 列 |
+
+- 刪除 `MEDIUM_THRESHOLD`（它只用在 `ReplaceNewlines` 的顯示換行，我們不需要）。
+- 新增 `shorten_display_sentence(text, max_bytes)`：照 `TextUtil.ShortenDisplaySentence`，
+  位元組數達上限時反覆砍掉「第一個標點以前」，找不到標點就原樣回傳。
+
+### 疊加層版面（`app/ui/system_subtitle.py`）
+
+照 `OverlayWindow.xaml` 改成兩個 QLabel（`row_widgets` 移除）：
+
+- 上方 `translation_label`：把保留的前幾句與當前句的翻譯用 `join_words` 接成
+  **一段**，前幾句 `#d0d0d0`、當前句白色，以 rich text `<span style="color:…">`
+  上色（文字先 `html.escape`）。當前句還沒翻好時就只顯示前幾句，不補「…」。
+- 下方 `original_label`：字級 `round(font_size * 0.8)`、顏色 `#cfe9ef`，顯示
+  `shorten_display_sentence(rows[-1].original, VERYLONG_THRESHOLD)`。
+- `rows[-1]` 不論 `is_final` 都當「當前句」（句子講完後仍留在畫面上，直到新字出現）。
+- `rows` 為空 → 兩個 label 都清空。`required_height`/`_fit_height`/`resizeEvent`
+  邏輯不變，只是改量這兩個 label。歷史面板不變。
+- 設定頁文案改為「保留前幾句翻譯（它們會接在正在講這句的前面）」，單位「句」；
+  範圍 1–5 與 config key `display_rows` 不變。
+
+### 不做
+
+- DisplayLoop 的 720ms 視覺停頓、Log Cards/CSV、翻譯引擎與麥克風管線都不動。
