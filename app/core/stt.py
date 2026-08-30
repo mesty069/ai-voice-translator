@@ -1,8 +1,11 @@
 import threading
+from collections import namedtuple
 
 import numpy as np
 
 from .cuda_dlls import register_cuda_dll_dirs
+
+Word = namedtuple("Word", "text start end")  # text 已 strip；秒，相對於送進去的音訊起點
 
 
 class SpeechToText:
@@ -95,3 +98,29 @@ class SpeechToText:
                 initial_prompt="以下是繁體中文的句子。" if language == "zh" else None,
             )
             return "".join(seg.text for seg in segments).strip()
+
+    def transcribe_words(self, audio: np.ndarray, language: str = "en",
+                         beam_size: int = 1) -> list:
+        """串流字幕用：回傳帶時間戳的字。句尾字的 end 用來推進音訊起點。
+
+        與 transcribe() 共用同一把鎖（同一顆模型、同一張 GPU）。
+        """
+        with self._lock:
+            model = self._model
+            if model is None:
+                raise RuntimeError("語音模型尚未載入完成")
+            segments, _info = model.transcribe(
+                audio,
+                language=language,
+                beam_size=beam_size,
+                vad_filter=True,
+                word_timestamps=True,
+                initial_prompt="以下是繁體中文的句子。" if language == "zh" else None,
+            )
+            words = []
+            for seg in segments:
+                for w in (getattr(seg, "words", None) or []):
+                    text = (w.word or "").strip()
+                    if text:
+                        words.append(Word(text, float(w.start), float(w.end)))
+            return words
