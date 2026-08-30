@@ -3,7 +3,12 @@
 做法照 SakiRinn/LiveCaptions-Translator：只翻「最後一個句尾標點之後」的
 目前句，文字穩定或夠長就翻、相同不重翻；完成句進歷史、疊加層顯示最近 N 行。
 """
+import threading
+import time
+
 from dataclasses import dataclass, replace
+
+from .local_translate import ModelLoadError
 
 PUNC_EOS = ".?!。？！"
 SHORT_THRESHOLD = 10       # 目前句短於此 → 翻譯時接前一句
@@ -140,3 +145,177 @@ class CaptionState:
         self._last_translated = None
         # 只保留顯示所需 + 一點餘裕，歷史另由 UI 記錄
         del self._finals[:-max(self.display_rows, 5)]
+
+
+class StreamingCaptionEngine:
+    """每 POLL_SEC 一輪：辨識「上一句句尾之後」的音訊 → 切句 → 翻譯 → on_rows。
+
+    所有回呼都在引擎執行緒上呼叫；stop() 之後一律不再回呼。
+    now/sleep 可注入以便測試。
+    """
+
+    STT_WAIT_TIMEOUT = 300.0
+    MIN_AUDIO_SEC = 0.5
+
+    def __init__(self, buffer, stt, translator, languages, mic_busy,
+                 on_rows, on_state, on_fatal, on_final,
+                 display_rows=DISPLAY_ROWS, now=time.monotonic, sleep=time.sleep):
+        self.buffer = buffer
+        self.stt = stt
+        self.translator = translator
+        self._languages = languages
+        self._mic_busy = mic_busy
+        self._on_rows = on_rows
+        self._on_state = on_state
+        self._on_fatal = on_fatal
+        self._on_final = on_final
+        self._now = now
+        self._sleep = sleep
+        self.state = CaptionState(display_rows)
+        self.committed_t = 0.0
+        self._running = True
+        self._thread = None
+        self._stt_wait_started = None
+        self._loading_announced = False
+
+    # ---- 生命週期 ----
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    def start(self):
+        self._running = True
+        self._thread = threading.Thread(target=self._run, daemon=True,
+                                        name="streaming-captions")
+        self._thread.start()
+
+    def stop(self):
+        self._running = False
+        thread, self._thread = self._thread, None
+        if thread is not None:
+            thread.join(timeout=0.1)
+
+    def set_display_rows(self, n: int):
+        self.state.set_display_rows(n)
+
+    def _run(self):
+        try:
+            import comtypes
+            comtypes.CoInitialize()
+        except Exception:
+            pass
+        while self._running:
+            started = self._now()
+            self.step()
+            elapsed = self._now() - started
+            remaining = POLL_SEC - elapsed
+            # 分段睡，stop() 才能在 0.1 秒內收到
+            while remaining > 0 and self._running:
+                self._sleep(min(0.1, remaining))
+                remaining -= 0.1
+
+    # ---- 一輪 ----
+
+    def step(self) -> bool:
+        if not self._running:
+            return False
+        try:
+            return self._step()
+        except ModelLoadError as e:
+            self._running = False
+            self._on_fatal(str(e))
+            return False
+        except Exception as e:
+            if self._running:
+                self._on_state("error", f"系統字幕處理失敗：{e}")
+            return False
+
+    def _step(self) -> bool:
+        if self._mic_busy():
+            return False   # 麥克風優先：使用者在說話時讓路
+        if not self._wait_stt():
+            return False
+        audio = self.buffer.since(self.committed_t)
+        sample_rate = self.buffer.sample_rate
+        if len(audio) < sample_rate * self.MIN_AUDIO_SEC:
+            return False
+
+        spoken, native = self._languages()
+        base_t = self.committed_t
+        words = self.stt.transcribe_words(audio, language=spoken, beam_size=1)
+        if not self._running:
+            return False
+        completed, current = split_sentences_by_words(words)
+        window_sec = self.buffer.total_seconds - base_t
+
+        # 窗太長又沒有任何句尾：把目前這串強制當一句
+        if not completed and current is not None and window_sec > WINDOW_MAX_SEC:
+            completed, current = [current], None
+
+        for sentence in completed:
+            # 翻譯要在 commit_text 之前算：commit_text 會把這句自己塞進
+            # finals，若先 commit 再翻，translate_input 的「前一句」就會
+            # 誤指到這句自己，短句會被錯誤地接上自己（見測試）。
+            translated = self._translate(sentence.text, spoken, native)
+            row = self.state.commit_text(sentence.text)
+            self.committed_t = base_t + sentence.end
+            row.translated = translated
+            self._on_final(sentence.text, translated)
+        if completed:
+            self.buffer.trim_before(self.committed_t)
+
+        if current is not None:
+            if self.state.update_current(current.text):
+                self.state.set_current_translation(
+                    self._translate(current.text, spoken, native))
+            # 尾端安靜夠久 → 這句講完了
+            if self.buffer.tail_peak(SILENCE_COMMIT_SEC) < MIN_PEAK:
+                row = self.state.commit_current()
+                if row is not None:
+                    if not row.translated:
+                        row.translated = self._translate(row.original, spoken, native)
+                    self._on_final(row.original, row.translated)
+                self.committed_t = self.buffer.total_seconds
+                self.buffer.trim_before(self.committed_t)
+        elif not completed:
+            # 這段音訊辨識不出字（雜音、音樂）：太長就丟掉，別一直重算
+            if window_sec > WINDOW_MAX_SEC:
+                self.committed_t = self.buffer.total_seconds
+                self.buffer.trim_before(self.committed_t)
+
+        if self._running:
+            self._on_rows(self.state.rows)
+        return True
+
+    # ---- 輔助 ----
+
+    def _translate(self, text: str, spoken: str, native: str) -> str:
+        announced = []
+
+        def progress(message):
+            if self._running:
+                announced.append(True)
+                self._on_state("loading", message)
+
+        result = self.translator.translate(self.state.translate_input(text),
+                                           spoken, native, progress_cb=progress)
+        if announced and self._running:
+            self._on_state("listening", "正在聽系統聲音…")
+        return result
+
+    def _wait_stt(self) -> bool:
+        """語音模型還在載入：回報一次「載入中」，這輪跳過；逾時視為致命。"""
+        if self.stt.is_ready:
+            self._stt_wait_started = None
+            self._loading_announced = False
+            return True
+        now = self._now()
+        if self._stt_wait_started is None:
+            self._stt_wait_started = now
+        if not self._loading_announced:
+            self._loading_announced = True
+            self._on_state("loading", "語音模型載入中，系統字幕稍後開始…")
+        if now - self._stt_wait_started >= self.STT_WAIT_TIMEOUT:
+            raise ModelLoadError("語音模型載入逾時，系統字幕已停止")
+        return False
