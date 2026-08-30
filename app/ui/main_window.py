@@ -283,6 +283,10 @@ class MainWindow(FluentWindow):
             self._apply_system_caption_style)
         self.settings.system_captions_pipeline_changed.connect(
             self._on_system_pipeline_changed)
+        # 上次關程式時系統字幕是開的 → 這次啟動也自動開（延後一個事件迴圈，
+        # 等主視窗先顯示；語音模型還在載入時引擎會自己等）
+        if self.config.get("system_captions", "enabled", default=False):
+            QTimer.singleShot(0, lambda: self.set_system_captions_enabled(True))
 
     def _on_hotkey_changed(self):
         self.controller.apply_hotkey()
