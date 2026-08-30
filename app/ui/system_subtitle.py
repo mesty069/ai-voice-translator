@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 
 from qfluentwidgets import FluentIcon, Theme, TransparentToolButton
 
+from ..core.streaming_captions import DISPLAY_ROWS
 from .overlay_base import DraggableResizableOverlay
 
 _FLAGS = (Qt.WindowType.FramelessWindowHint
@@ -67,7 +68,7 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         self.rows_layout = QVBoxLayout()
         self.rows_layout.setSpacing(4)
         outer.addLayout(self.rows_layout)
-        self.row_widgets = []   # [(original_label, translated_label), ...]
+        self.row_widgets = []   # [(原文 QLabel, 翻譯 QLabel), ...]
         outer.addStretch(1)
 
         self.history_view = QTextEdit(self)
@@ -83,6 +84,19 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
 
     # ---- 對外 API ----
 
+    def preferred_height(self, rows: int) -> int:
+        """放得下 rows 行（每行原文小字 + 翻譯大字）所需的高度。
+
+        MIN_SIZE 的 130px 是為兩個 label 設計的，三行會被裁掉，所以依
+        字級估：標頭 30 + 每行（0.8×字級 原文 + 字級 翻譯 + 行距 12）
+        + 上下邊界 26，且不低於 MIN_SIZE。
+        """
+        size = int(self.config.get(
+            self.CONFIG_SECTION, "font_size", default=20))
+        per_row = max(12, round(size * 0.8)) + size + 12
+        needed = 30 + max(0, int(rows)) * per_row + 26
+        return max(MIN_SIZE.height(), needed)
+
     def show_overlay(self, screen=None):
         pos = self.saved_pos()
         if pos is not None:
@@ -95,7 +109,8 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
             height = max(size[1], MIN_SIZE.height())
         else:
             width = max(min(int(geo.width() * 0.5), 780), MIN_SIZE.width())
-            height = MIN_SIZE.height()
+            height = self.preferred_height(self.config.get(
+                self.CONFIG_SECTION, "display_rows", default=DISPLAY_ROWS))
         self.resize(width, height)
         if pos is not None:
             self.move(pos)
@@ -125,6 +140,10 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         for (original, translated), row in zip(self.row_widgets, rows):
             original.setText(row.original)
             translated.setText(row.translated or ("…" if not row.is_final else ""))
+        # 行數變多時自己長高；使用者拉大過的高度就尊重，只放大不縮小
+        needed = self.preferred_height(len(rows))
+        if self.height() < needed:
+            self.resize(self.width(), needed)
         self.apply_style()
 
     def add_history(self, original: str, translated: str):

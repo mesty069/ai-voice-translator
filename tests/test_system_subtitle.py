@@ -57,3 +57,41 @@ def test_apply_style_survives_row_count_change(tmp_path, qapp):
     ov.config.set("system_captions", "font_size", 30)
     ov.apply_style()
     assert ov.row_widgets[1][1].font().pixelSize() == 30
+
+
+def test_preferred_height_grows_with_rows_and_font(tmp_path, qapp):
+    """C1：高度要跟著行數與字級長。"""
+    ov = _overlay(tmp_path, qapp)
+    assert ov.preferred_height(1) >= 130
+    assert ov.preferred_height(3) > ov.preferred_height(1)
+    small = ov.preferred_height(3)
+    ov.config.set("system_captions", "font_size", 30)
+    assert ov.preferred_height(3) > small
+
+
+def test_set_rows_grows_overlay_to_fit_three_rows(tmp_path, qapp):
+    """C1：三行字幕不能被裁掉，要自己長高。"""
+    ov = _overlay(tmp_path, qapp)
+    ov.resize(360, 130)
+    ov.set_rows([Row("One.", "一。", True), Row("Two.", "二。", True),
+                 Row("Three", "", False)])
+    assert ov.height() >= ov.preferred_height(3)
+    assert ov.width() == 360      # 只長高、不動寬
+
+
+def test_set_rows_never_shrinks_user_resized_overlay(tmp_path, qapp):
+    """C1：使用者自己拉大的高度不能被縮回去。"""
+    ov = _overlay(tmp_path, qapp)
+    tall = ov.preferred_height(3) + 200
+    ov.resize(400, tall)
+    ov.set_rows([Row("One.", "一。", True)])
+    assert ov.height() == tall
+
+
+def test_show_overlay_without_saved_size_fits_display_rows(tmp_path, qapp):
+    """C1：第一次顯示就要放得下設定的行數。"""
+    ov = _overlay(tmp_path, qapp)
+    ov.config.set("system_captions", "display_rows", 3)
+    ov.show_overlay()
+    assert ov.height() >= ov.preferred_height(3)
+    ov.hide()
