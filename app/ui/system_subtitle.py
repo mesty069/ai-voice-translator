@@ -140,11 +140,40 @@ class SystemSubtitleOverlay(DraggableResizableOverlay):
         for (original, translated), row in zip(self.row_widgets, rows):
             original.setText(row.original)
             translated.setText(row.translated or ("…" if not row.is_final else ""))
-        # 行數變多時自己長高；使用者拉大過的高度就尊重，只放大不縮小
-        needed = self.preferred_height(len(rows))
+        self.apply_style()   # 先套字型，量高度才準
+        self._fit_height(len(rows))
+
+    def required_height(self, rows: int) -> int:
+        """目前寬度下真正放得下所有文字（含換行）的高度。
+
+        preferred_height 只按行數估；長句換行後會更高。不能問 layout 的
+        heightForWidth：剛 addWidget 完它的快取還沒更新（回 -1），要等下一輪
+        事件迴圈；QLabel 自己的 heightForWidth 則立刻就準，所以逐個加總。
+        邊界 20/10/12/16 與行距 6/4 對應 __init__ 裡的 layout 設定。
+        """
+        margins = self.layout().contentsMargins()
+        label_width = max(50, self.width() - margins.left() - margins.right())
+        header_h = max(22, self.tag_label.sizeHint().height())
+        labels = [lbl for pair in self.row_widgets for lbl in pair]
+        text_h = sum(lbl.heightForWidth(label_width) for lbl in labels)
+        gaps = self.rows_layout.spacing() * max(0, len(labels) - 1)
+        needed = (margins.top() + header_h + self.layout().spacing()
+                  + text_h + gaps + margins.bottom())
+        return max(self.preferred_height(rows), needed)
+
+    def _fit_height(self, rows: int):
+        """把最小高度設成實際需求：Qt 會自動把視窗撐開，文字不會被裁掉；
+        使用者拉大過的高度照樣尊重（只設下限，不主動縮小）。"""
+        needed = self.required_height(rows)
+        self.setMinimumHeight(needed)
         if self.height() < needed:
             self.resize(self.width(), needed)
-        self.apply_style()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # 拉窄後文字會多折幾行，需求高度變了要重算
+        if event.oldSize().width() != event.size().width() and self.row_widgets:
+            self._fit_height(len(self.row_widgets))
 
     def add_history(self, original: str, translated: str):
         self._history.append((original, translated))

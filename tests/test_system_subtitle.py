@@ -95,3 +95,24 @@ def test_show_overlay_without_saved_size_fits_display_rows(tmp_path, qapp):
     ov.show_overlay()
     assert ov.height() >= ov.preferred_height(3)
     ov.hide()
+
+
+def test_wrapped_long_text_is_not_clipped(tmp_path, qapp):
+    """長句換行後，視窗高度必須放得下所有 label（使用者回報被裁掉）。"""
+    ov = _overlay(tmp_path, qapp)
+    ov.show()   # 隱藏的 widget 不會收到 resizeEvent（Qt 延後到 show）
+    ov.resize(600, ov.preferred_height(3))
+    long_en = "This is a deliberately long English sentence that will certainly wrap " * 3
+    long_zh = "這是一句故意寫得非常長、一定會換行的中文翻譯結果，用來確認字幕框會跟著長高。" * 2
+    ov.set_rows([Row(long_en, long_zh, True), Row(long_en, long_zh, True),
+                 Row("short", "短", False)])
+    qapp.processEvents()
+    assert ov.height() >= ov.layout().heightForWidth(ov.width())
+    assert ov.height() > ov.preferred_height(3)      # 換行確實比估值高
+    # 拉窄 → 折更多行 → 再長高
+    before = ov.height()
+    ov.resize(360, before)   # MIN_SIZE 寬 360，不能再窄
+    qapp.processEvents()
+    assert ov.width() == 360
+    assert ov.height() >= ov.layout().heightForWidth(360)
+    assert ov.height() > before
