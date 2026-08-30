@@ -173,3 +173,60 @@ def test_real_engine_thread_starts_and_stops_quickly(tmp_path):
     t0 = time.monotonic()
     ctrl.stop()
     assert time.monotonic() - t0 < 0.5
+
+
+def test_engine_fatal_also_stops_capture(tmp_path):
+    """B1：引擎致命 → 擷取不能繼續錄 loopback。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl.start()
+    cap, eng = _FakeCapture.instances[0], _FakeEngine.instances[0]
+    eng.on_fatal("no model")
+    assert cap.stopped is True
+    assert eng.stopped is True
+    assert ctrl.is_running is False
+
+
+def test_capture_error_also_stops_engine(tmp_path):
+    """B1：擷取死掉 → 引擎不能繼續空轉 poll。"""
+    cfg, ctrl = _controller(tmp_path)
+    ctrl.start()
+    cap, eng = _FakeCapture.instances[0], _FakeEngine.instances[0]
+    cap.on_error(RuntimeError("dead"))
+    assert eng.stopped is True
+    assert cap.stopped is True
+
+
+def test_fatal_reports_error_but_not_idle(tmp_path):
+    """B1：致命錯誤要留在 error 狀態，不能被 idle 蓋掉。"""
+    cfg, ctrl = _controller(tmp_path)
+    states = []
+    ctrl.state_changed.connect(lambda s, m: states.append(s))
+    ctrl.start()
+    _FakeEngine.instances[0].on_fatal("no model")
+    assert states[-1] == "error"
+    assert "idle" not in states
+
+
+def test_second_fatal_in_same_generation_is_ignored(tmp_path):
+    """B2：擷取與引擎同時陣亡時只提示一次。"""
+    cfg, ctrl = _controller(tmp_path)
+    fatals, states = [], []
+    ctrl.fatal_error.connect(fatals.append)
+    ctrl.state_changed.connect(lambda s, m: states.append(s))
+    ctrl.start()
+    cap, eng = _FakeCapture.instances[0], _FakeEngine.instances[0]
+    eng.on_fatal("no model")
+    cap.on_error(RuntimeError("dead"))
+    assert fatals == ["no model"]
+    assert states.count("error") == 1
+
+
+def test_stop_after_fatal_does_not_emit_idle(tmp_path):
+    """致命錯誤已經拆乾淨了，之後使用者關功能不該再冒「已停止」。"""
+    cfg, ctrl = _controller(tmp_path)
+    states = []
+    ctrl.start()
+    _FakeEngine.instances[0].on_fatal("no model")
+    ctrl.state_changed.connect(lambda s, m: states.append(s))
+    ctrl.stop()
+    assert states == []

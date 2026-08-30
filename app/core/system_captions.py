@@ -71,14 +71,7 @@ class SystemCaptionsController(QObject):
     def stop(self):
         if not self._running and self._capture is None and self._engine is None:
             return
-        self._running = False
-        self._generation += 1   # 先變號：舊回呼從此無效
-        capture, self._capture = self._capture, None
-        engine, self._engine = self._engine, None
-        if capture is not None:
-            capture.stop()      # join ≤ 0.2s
-        if engine is not None:
-            engine.stop()       # join ≤ 0.1s
+        self._teardown()
         self.state_changed.emit("idle", "已停止系統聲音字幕")
 
     def set_display_rows(self, n: int):
@@ -94,6 +87,21 @@ class SystemCaptionsController(QObject):
         spoken = self.config.get("system_captions", "language", default="")
         return (spoken or target), native
 
+    def _teardown(self):
+        """停掉擷取與引擎並讓舊回呼失效（stop() 與 _on_fatal 共用）。
+
+        兩條執行緒是綁在一起的：擷取死了引擎只會空轉 poll，引擎死了擷取
+        還在錄 loopback，所以任一邊致命都要把另一邊也收掉。
+        """
+        self._running = False
+        self._generation += 1   # 先變號：舊回呼從此無效
+        capture, self._capture = self._capture, None
+        engine, self._engine = self._engine, None
+        if capture is not None:
+            capture.stop()      # join ≤ 0.2s
+        if engine is not None:
+            engine.stop()       # join ≤ 0.1s
+
     def _guarded(self, gen, emit, *args):
         if gen == self._generation and self._running:
             emit(*args)
@@ -104,7 +112,7 @@ class SystemCaptionsController(QObject):
 
     def _on_fatal(self, message, gen):
         if gen != self._generation:
-            return
-        self._running = False
+            return          # 世代已變（stop 過或另一邊先致命）→ 只提示一次
+        self._teardown()    # 不發 "idle"：狀態要停在 error
         self.fatal_error.emit(message)
         self.state_changed.emit("error", message)

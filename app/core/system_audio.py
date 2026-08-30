@@ -117,7 +117,9 @@ class SystemAudioCapture:
     def stop(self):
         self._running = False
         thread, self._thread = self._thread, None
-        if thread is not None:
+        # on_error 是在擷取執行緒上回呼的，呼叫端會反手 stop() 擷取，
+        # 這時 join 自己會丟 RuntimeError；此時只要把旗標放掉就好。
+        if thread is not None and thread is not threading.current_thread():
             # 讀取區塊只有 0.1 秒，稍等即可收屍；等太久會卡住呼叫端的 GUI 執行緒
             thread.join(timeout=0.2)
 

@@ -151,3 +151,14 @@ def test_capture_error_is_reported(monkeypatch):
         time.sleep(0.01)
     assert errors and "no loopback" in str(errors[0])
     assert cap.is_running is False
+
+
+def test_stop_from_capture_thread_does_not_join_itself():
+    """擷取失敗是在擷取執行緒上回呼的，控制器會反手 stop() 擷取。"""
+    import threading
+
+    cap = SystemAudioCapture()
+    cap._running = True
+    cap._thread = threading.current_thread()
+    cap.stop()                       # 不得丟 RuntimeError
+    assert cap.is_running is False
