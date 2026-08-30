@@ -11,13 +11,15 @@ from dataclasses import dataclass, replace
 from .local_translate import ModelLoadError
 
 PUNC_EOS = ".?!。？！"
+PUNC_COMMA = ",，、—\n"     # 顯示用的截斷點（照 TextUtil 的 PUNC_COMMA）
 SHORT_THRESHOLD = 10       # 完成句短於此（UTF-8 位元組）→ 併進前一句
-MEDIUM_THRESHOLD = 40      # 文字變了且長於此 → 立即重翻
+VERYLONG_THRESHOLD = 220   # 疊加層顯示原文的上限（UTF-8 位元組），超過就從頭截
 WINDOW_MAX_SEC = 12.0      # 開放音訊窗上限
-POLL_SEC = 1.0             # 兩輪辨識的最小間隔
-IDLE_ROUNDS = 2            # 文字連續幾輪沒變就翻
+POLL_SEC = 0.5             # 兩輪辨識的最小間隔
+IDLE_SEC = 1.25            # 文字停住這麼久就翻（= 它的 MaxIdleInterval 50 × 25ms）
+MAX_SYNC = 3               # 文字連續變這麼多次（不算短句）就翻（= MaxSyncInterval）
 SILENCE_COMMIT_SEC = 1.5   # 尾端靜音多久把未完句視為完成
-DISPLAY_ROWS = 3           # 預設顯示行數
+DISPLAY_ROWS = 3           # 預設保留前幾句翻譯（rows 另外再帶當前句）
 MIN_PEAK = 0.01            # 低於此視為靜音
 
 
@@ -54,6 +56,21 @@ def join_words(texts: list) -> str:
     return out
 
 
+def shorten_display_sentence(text: str, max_bytes: int = VERYLONG_THRESHOLD) -> str:
+    """太長的句子只顯示後半段（照 TextUtil.ShortenDisplaySentence）。
+
+    UTF-8 位元組數達 max_bytes 時，反覆把「第一個標點以前」砍掉，直到夠短
+    或再也找不到標點（找不到就原樣回傳，寧可長也不要砍在半個詞上）。
+    """
+    while len(text.encode("utf-8")) >= max_bytes:
+        index = next((i for i, ch in enumerate(text)
+                      if ch in PUNC_EOS or ch in PUNC_COMMA), -1)
+        if index < 0 or index + 1 >= len(text):
+            break
+        text = text[index + 1:].lstrip()
+    return text
+
+
 def split_sentences_by_words(words):
     """把帶時間戳的字切成 (完成句列表, 目前未完句或 None)。"""
     completed, pending = [], []
@@ -82,7 +99,8 @@ class CaptionState:
         self.display_rows = display_rows
         self._finals = []
         self._current = None
-        self._idle = 0
+        self._last_change_t = 0.0      # 目前句原文最後一次變動的時間（秒）
+        self._sync_count = 0           # 原文變了幾次（短句不算），照 syncCount
         self._last_translated = None   # 上次送翻譯的 current 原文
 
     def set_display_rows(self, n: int):
@@ -90,10 +108,11 @@ class CaptionState:
 
     @property
     def rows(self) -> list:
+        """保留的前幾句 + 當前句：共 display_rows + 1 列。"""
         rows = list(self._finals)
         if self._current is not None:
             rows.append(self._current)
-        return [replace(r) for r in rows[-self.display_rows:]]
+        return [replace(r) for r in rows[-(self.display_rows + 1):]]
 
     @property
     def previous_final_text(self) -> str:
@@ -113,24 +132,35 @@ class CaptionState:
         """
         return replace(self._current) if self._current is not None else None
 
-    def update_current(self, text: str) -> bool:
-        """更新目前句原文，回傳這一輪是否要翻譯它。"""
+    def update_current(self, text: str, now: float) -> bool:
+        """更新目前句原文，回傳這一輪是否要翻譯它。
+
+        觸發條件照 LiveCaptions-Translator 的 SyncLoop，只是把「輪數」換成
+        「時間」（它每 25ms 一輪、我們每輪要跑一次 Whisper，輪數不可比）：
+        - 原文停住 IDLE_SEC 沒變 → 翻（MaxIdleInterval）
+        - 原文變了超過 MAX_SYNC 次（短句不計） → 翻並歸零（MaxSyncInterval）
+        - 以句尾標點結尾 → 立刻翻並歸零
+        相同文字不重翻（`_last_translated`），這點比它嚴格。
+        """
         if self._current is None:
             self._current = Row(text)
             changed = True
-            self._idle = 0
         elif text != self._current.original:
             self._current.original = text   # 翻譯先留著，重翻後才換
             changed = True
-            self._idle = 0
         else:
             changed = False
-            self._idle += 1
+        if changed:
+            self._last_change_t = now
+            if not self.is_short(text):
+                self._sync_count += 1
         if not text or text == self._last_translated:
             return False
-        ends_sentence = text[-1] in PUNC_EOS
-        return (ends_sentence or self._idle >= IDLE_ROUNDS
-                or (changed and len(text) >= MEDIUM_THRESHOLD))
+        if text[-1] in PUNC_EOS or self._sync_count > MAX_SYNC:
+            self._sync_count = 0
+            return True
+        # 它的 idleCount 分支不歸零 syncCount，這裡照做
+        return now - self._last_change_t >= IDLE_SEC
 
     def set_current_translation(self, translated: str):
         if self._current is not None:
@@ -194,10 +224,11 @@ class CaptionState:
 
     def _reset_current(self):
         self._current = None
-        self._idle = 0
+        self._last_change_t = 0.0
+        self._sync_count = 0
         self._last_translated = None
         # 只保留顯示所需 + 一點餘裕，歷史另由 UI 記錄
-        del self._finals[:-max(self.display_rows, 5)]
+        del self._finals[:-max(self.display_rows + 1, 5)]
 
 
 class StreamingCaptionEngine:
@@ -358,7 +389,8 @@ class StreamingCaptionEngine:
                                        self.buffer.total_seconds - WINDOW_MAX_SEC)
             self.buffer.trim_before(self.committed_t)
 
-        if current is not None and self.state.update_current(current.text):
+        if (current is not None
+                and self.state.update_current(current.text, self._now())):
             self.state.set_current_translation(
                 self._translate(current.text, spoken, native))
 

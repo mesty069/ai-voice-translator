@@ -10,7 +10,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from app.core.local_translate import ModelLoadError  # noqa: E402
 from app.core.stt import Word  # noqa: E402
 from app.core.streaming_captions import (  # noqa: E402
-    IDLE_ROUNDS,
+    IDLE_SEC,
     SILENCE_COMMIT_SEC,
     WINDOW_MAX_SEC,
     StreamingCaptionEngine,
@@ -45,9 +45,24 @@ class _FakeTranslator:
         return f"譯[{text}]"
 
 
+class _Clock:
+    """可推進的假時鐘：引擎的觸發時序改成看時間，測試要自己控制它。"""
+
+    def __init__(self, t=0.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+    def advance(self, seconds):
+        self.t += seconds
+        return self.t
+
+
 class _Sink:
     def __init__(self):
         self.rows, self.states, self.fatals, self.finals = [], [], [], []
+        self.clock = _Clock()
 
 
 def _engine(stt, translator=None, buffer=None, sink=None, mic_busy=lambda: False,
@@ -61,7 +76,7 @@ def _engine(stt, translator=None, buffer=None, sink=None, mic_busy=lambda: False
         on_state=lambda s, m: sink.states.append((s, m)),
         on_fatal=sink.fatals.append,
         on_final=lambda o, t: sink.finals.append((o, t)),
-        now=now or (lambda: 0.0), sleep=sleep or (lambda s: None))
+        now=now or sink.clock, sleep=sleep or (lambda s: None))
     return eng, buffer, sink
 
 
@@ -88,9 +103,9 @@ def test_current_sentence_shows_then_translates_when_stable():
     assert sink.rows[-1][-1].original == "The meeting"
     assert sink.rows[-1][-1].translated == ""
     assert tr.calls == []
-    for _ in range(IDLE_ROUNDS):
-        buf.append(_speech(1.0))
-        eng.step()
+    sink.clock.advance(IDLE_SEC + 0.05)      # 文字停住夠久 → 翻
+    buf.append(_speech(1.0))
+    eng.step()
     assert tr.calls == ["The meeting"]
     assert sink.rows[-1][-1].translated == "譯[The meeting]"
     assert sink.rows[-1][-1].is_final is False
@@ -155,9 +170,11 @@ def test_short_current_sentence_is_translated_alone():
     eng, buf, sink = _engine(stt, tr)
     buf.append(_speech(1.5))
     eng.step()
-    for _ in range(IDLE_ROUNDS + 1):
-        buf.append(_speech(1.0))
-        eng.step()
+    buf.append(_speech(1.0))
+    eng.step()                               # 目前句「Now」出現
+    sink.clock.advance(IDLE_SEC + 0.05)
+    buf.append(_speech(1.0))
+    eng.step()
     assert tr.calls == ["A fairly long sentence.", "Now"]
 
 
@@ -239,11 +256,11 @@ def test_set_display_rows_applies_next_round():
     eng, buf, sink = _engine(stt)
     buf.append(_speech(1.5))
     eng.step()
-    assert len(sink.rows[-1]) == 3
+    assert len(sink.rows[-1]) == 4          # 前 3 句 + 當前句
     eng.set_display_rows(2)
     buf.append(_speech(0.5))
     eng.step()
-    assert len(sink.rows[-1]) == 2
+    assert len(sink.rows[-1]) == 3
 
 
 # ---- 修復波 1 ----

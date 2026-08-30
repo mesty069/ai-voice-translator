@@ -5,13 +5,15 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from app.core.stt import Word  # noqa: E402
 from app.core.streaming_captions import (  # noqa: E402
-    IDLE_ROUNDS,
-    MEDIUM_THRESHOLD,
+    IDLE_SEC,
+    MAX_SYNC,
     SHORT_THRESHOLD,
+    VERYLONG_THRESHOLD,
     CaptionState,
     Row,
     Sentence,
     join_words,
+    shorten_display_sentence,
     split_sentences_by_words,
 )
 
@@ -64,67 +66,119 @@ def test_split_cjk_eos():
 
 # ---- CaptionState ----
 
-def test_current_grows_and_translates_after_idle_rounds():
+def test_current_grows_and_translates_after_idle_seconds():
+    """照 LiveCaptions-Translator 的 MaxIdleInterval：文字停住 IDLE_SEC 就翻。"""
     st = CaptionState(display_rows=3)
-    assert st.update_current("The meeting") is False
+    assert st.update_current("The meeting", 0.0) is False
     assert st.rows == [Row("The meeting", "", False)]
-    assert st.update_current("The meeting will") is False   # 變了、不夠長
-    for _ in range(IDLE_ROUNDS - 1):
-        assert st.update_current("The meeting will") is False
-    assert st.update_current("The meeting will") is True     # idle 達門檻
-    st.set_current_translation("會議將")
-    assert st.rows == [Row("The meeting will", "會議將", False)]
+    assert st.update_current("The meeting", 1.0) is False       # 還沒停夠久
+    assert st.update_current("The meeting", IDLE_SEC + 0.05) is True
+    st.set_current_translation("會議")
+    assert st.rows == [Row("The meeting", "會議", False)]
+
+
+def test_idle_timer_restarts_when_text_changes():
+    st = CaptionState()
+    assert st.update_current("The meeting", 0.0) is False
+    assert st.update_current("The meeting will", 1.2) is False   # 變了 → 重新計時
+    assert st.update_current("The meeting will", 2.0) is False
+    assert st.update_current("The meeting will", 2.5) is True
 
 
 def test_same_text_is_not_retranslated():
     st = CaptionState()
-    for _ in range(IDLE_ROUNDS + 1):
-        need = st.update_current("Stable text")
-    assert need is True
+    assert st.update_current("Stable text", 0.0) is False
+    assert st.update_current("Stable text", 2.0) is True
     st.set_current_translation("穩定")
-    for _ in range(5):
-        assert st.update_current("Stable text") is False
+    for i in range(5):
+        assert st.update_current("Stable text", 3.0 + i) is False
 
 
-def test_long_change_translates_immediately():
+def test_sync_count_translates_after_max_sync_changes():
+    """照 MaxSyncInterval：文字連續變 MAX_SYNC+1 次（每次都不算短句）就翻。"""
     st = CaptionState()
-    long_text = "x" * MEDIUM_THRESHOLD
-    assert st.update_current(long_text) is True
+    texts = ["The meeting", "The meeting will", "The meeting will begin",
+             "The meeting will begin now"]
+    assert len(texts) == MAX_SYNC + 1
+    for i, text in enumerate(texts[:-1]):
+        assert st.update_current(text, i * 0.1) is False
+    assert st.update_current(texts[-1], (len(texts) - 1) * 0.1) is True
+    # 觸發後歸零：接下來又要再變 MAX_SYNC+1 次
+    st.set_current_translation("會議即將開始")
+    for i, text in enumerate(["a" * 12, "a" * 13, "a" * 14]):
+        assert st.update_current(text, 1.0 + i * 0.1) is False
+    assert st.update_current("a" * 15, 1.3) is True
+
+
+def test_short_text_changes_never_trigger_sync():
+    """短文字（UTF-8 位元組 < SHORT_THRESHOLD）變再多次也不因 sync 觸發。"""
+    st = CaptionState()
+    for i in range(MAX_SYNC + 4):
+        text = "a" * (i + 1)                 # 最長 7 位元組，仍是短句
+        assert len(text.encode("utf-8")) < SHORT_THRESHOLD
+        assert st.update_current(text, i * 0.1) is False
 
 
 def test_eos_translates_immediately():
     st = CaptionState()
-    assert st.update_current("Done.") is True
+    assert st.update_current("Done.", 0.0) is True
 
 
 def test_translation_kept_while_text_grows():
     st = CaptionState()
-    st.update_current("Hello")
+    st.update_current("Hello", 0.0)
     st.set_current_translation("你好")
-    st.update_current("Hello there")
+    st.update_current("Hello there", 0.1)
     assert st.rows[-1] == Row("Hello there", "你好", False)
 
 
 def test_commit_text_pushes_rows_and_caps_display():
+    """display_rows 是「保留前幾句」，rows 另外再帶上當前句 → display_rows + 1 列。"""
     # 句子都刻意寫長（>= SHORT_THRESHOLD 位元組），免得被短句合併規則併成一列
     st = CaptionState(display_rows=3)
-    st.update_current("partial")
+    st.update_current("partial", 0.0)
     r1 = st.commit_text("Sentence one.")
     r1.translated = "第一句。"
     assert st.rows == [Row("Sentence one.", "第一句。", True)]     # current 清掉了
     st.commit_text("Sentence two.")
     st.commit_text("Sentence three.")
     st.commit_text("Sentence four.")
-    st.update_current("Five")
+    st.update_current("Five", 0.0)
+    assert [r.original for r in st.rows] == [
+        "Sentence two.", "Sentence three.", "Sentence four.", "Five"]
+    st.set_display_rows(2)
     assert [r.original for r in st.rows] == [
         "Sentence three.", "Sentence four.", "Five"]
-    st.set_display_rows(2)
-    assert [r.original for r in st.rows] == ["Sentence four.", "Five"]
+
+
+def test_rows_keeps_display_rows_previous_sentences_plus_current():
+    st = CaptionState(display_rows=1)
+    st.commit_text("Sentence one.")
+    st.commit_text("Sentence two.")
+    st.update_current("Three", 0.0)
+    assert [r.original for r in st.rows] == ["Sentence two.", "Three"]
+
+
+# ---- shorten_display_sentence ----
+
+def test_shorten_display_sentence_keeps_short_text():
+    assert shorten_display_sentence("Hello there.", VERYLONG_THRESHOLD) == \
+        "Hello there."
+
+
+def test_shorten_display_sentence_cuts_before_first_punctuation():
+    tail = "b" * 230
+    assert shorten_display_sentence("A, " + tail, VERYLONG_THRESHOLD) == tail
+
+
+def test_shorten_display_sentence_without_punctuation_is_unchanged():
+    text = "c" * 300
+    assert shorten_display_sentence(text, VERYLONG_THRESHOLD) == text
 
 
 def test_commit_current_keeps_translation():
     st = CaptionState()
-    st.update_current("Trailing")
+    st.update_current("Trailing", 0.0)
     st.set_current_translation("尾句")
     row = st.commit_current()
     assert row == Row("Trailing", "尾句", True)
@@ -179,7 +233,7 @@ def test_commit_text_does_not_merge_long_sentence():
 def test_commit_current_merges_short_pending_into_previous_row():
     st = CaptionState()
     st.commit_text("Previous sentence here.")
-    st.update_current("Yes")
+    st.update_current("Yes", 0.0)
     st.set_current_translation("是")
     row = st.commit_current()
     assert row.original == "Previous sentence here. Yes"
@@ -190,7 +244,7 @@ def test_commit_current_merges_short_pending_into_previous_row():
 
 def test_rows_returns_copies():
     st = CaptionState()
-    st.update_current("a")
+    st.update_current("a", 0.0)
     st.rows[0].original = "mutated"
     assert st.rows[0].original == "a"
 
@@ -199,7 +253,7 @@ def test_has_current_tracks_pending_row():
     """A2：辨識器這輪沒回字時，引擎仍要知道有未完句待收。"""
     st = CaptionState()
     assert st.has_current is False
-    st.update_current("partial")
+    st.update_current("partial", 0.0)
     assert st.has_current is True
     st.commit_current()
     assert st.has_current is False
@@ -209,7 +263,7 @@ def test_current_row_is_a_copy_of_the_pending_row():
     """F1：引擎要在 commit 之前先讀目前句（翻譯失敗時原句才留得住）。"""
     st = CaptionState()
     assert st.current_row is None
-    st.update_current("Trailing")
+    st.update_current("Trailing", 0.0)
     st.set_current_translation("尾句")
     row = st.current_row
     assert row == Row("Trailing", "尾句", False)
