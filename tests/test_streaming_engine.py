@@ -419,3 +419,27 @@ def test_committed_t_stops_at_next_sentence_start_when_translation_fails():
     eng.step()
     assert sink.finals == [("One.", "譯[One.]")]
     assert abs(eng.committed_t - 1.0) < 1e-6     # 不是 "One." 的 end 0.4
+
+
+def test_silent_window_is_skipped_without_transcribing():
+    """F3：整個開放窗都是靜音、又沒有未完句要收 → 不辨識，直接把窗推掉。"""
+    stt = _ScriptedStt([[Word("x", 0.0, 0.1)]])
+    eng, buf, sink = _engine(stt)
+    buf.append(_silence(3.0))
+    assert eng.step() is False
+    assert stt.calls == []
+    assert abs(eng.committed_t - buf.total_seconds) < 1e-6
+    assert abs(buf.start_seconds - buf.total_seconds) < 1e-6   # 已 trim
+    assert sink.rows == []
+
+
+def test_silent_window_still_transcribed_while_a_sentence_is_pending():
+    """F3：有未完句時不能短路，否則靜音收句那條路就永遠走不到。"""
+    stt = _ScriptedStt([[Word("Trailing", 0.0, 0.4)], []])
+    eng, buf, sink = _engine(stt)
+    buf.append(_speech(1.0))
+    eng.step()
+    buf.append(_silence(SILENCE_COMMIT_SEC + 0.1))
+    assert eng.step() is True
+    assert len(stt.calls) == 2
+    assert sink.finals == [("Trailing", "譯[Trailing]")]

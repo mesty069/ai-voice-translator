@@ -275,6 +275,16 @@ class StreamingCaptionEngine:
         if len(audio) < sample_rate * self.MIN_AUDIO_SEC:
             return False
 
+        # 整個開放窗都是靜音、又沒有未完句要收：跳過辨識，直接把窗推掉。
+        # 不然持續靜音時窗會一路長到 WINDOW_MAX_SEC，每秒把同一段無聲音訊
+        # 重算一次。有未完句時不能短路，否則靜音收句那條路就走不到了。
+        open_sec = self.buffer.total_seconds - self.committed_t
+        if (not self.state.has_current
+                and self.buffer.tail_peak(open_sec) < MIN_PEAK):
+            self.committed_t = self.buffer.total_seconds
+            self.buffer.trim_before(self.committed_t)
+            return False
+
         spoken, native = self._languages()
         base_t = self.committed_t
         words = self.stt.transcribe_words(audio, language=spoken, beam_size=1)
