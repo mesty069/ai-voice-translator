@@ -221,7 +221,10 @@ class MainWindow(FluentWindow):
         self.subtitle = SubtitleOverlay(config)
         self.subtitle.replay_requested.connect(controller.replay_tts)
         self.subtitle.rate_changed.connect(self.settings.set_tts_rate)
+        self.subtitle.volume_changed.connect(self.settings.set_tts_volume)
         self.subtitle.retranslate_requested.connect(controller.translate_text)
+        # 點單字方塊 → 從那個字開始念（走 controller 才有 tts_playing 狀態）
+        self.subtitle.speak_requested.connect(controller.speak_text)
         self.wait_hint = WaitHintOverlay()
         controller.wait_hint_visible.connect(self._on_wait_hint)
         self.float_input = FloatingInputWidget(config)
