@@ -418,12 +418,14 @@ class AppController(QObject):
             if is_latest:
                 self.tts_playing.emit(False)
 
+        volume = int(self.config.get("output", "tts_volume", default=100))
         tts.submit(
             english,
             self.config.get("output", "tts_device", default="default"),
             self.config.get("output", "tts_rate", default=tts.DEFAULT_RATE),
             self.config.get("language", "target", default="en"),
-            on_start, on_done)
+            on_start, on_done,
+            volume=max(0, min(100, volume)) / 100.0)
 
     def replay_tts(self):
         """重新播放最後一句英文語音（GUI 執行緒呼叫，不論 TTS 開關）。"""

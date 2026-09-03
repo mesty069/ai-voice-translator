@@ -76,6 +76,7 @@ DEFAULT_CONFIG = {
         "tts_enabled": True,
         "tts_device": "default",
         "tts_rate": 200,
+        "tts_volume": 100,   # 朗讀音量百分比（0–100）
     },
     "recording": {
         "device": "default",

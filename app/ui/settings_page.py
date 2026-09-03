@@ -268,6 +268,11 @@ class SettingsInterface(ScrollArea):
         self.tts_rate_spin.setRange(80, 350)
         self.tts_rate_spin.setSingleStep(10)
         self._add_row(layout, "朗讀語速（預設 200，越大越快）", self.tts_rate_spin)
+        self.tts_volume_spin = SpinBox(self.view)
+        self.tts_volume_spin.setRange(0, 100)
+        self.tts_volume_spin.setSingleStep(5)
+        self.tts_volume_spin.setSuffix(" %")
+        self._add_row(layout, "朗讀音量（預設 100%）", self.tts_volume_spin)
 
         # ---- 麥克風 ----
         layout.addSpacing(8)
@@ -397,6 +402,8 @@ class SettingsInterface(ScrollArea):
                 self.tts_device_combo.setCurrentIndex(i)
                 break
         self.tts_rate_spin.setValue(cfg.get("output", "tts_rate", default=200))
+        self.tts_volume_spin.setValue(
+            cfg.get("output", "tts_volume", default=100))
 
         self.mic_device_combo.setCurrentIndex(0)
         mic_device = cfg.get("recording", "device", default=DEFAULT_DEVICE)
@@ -534,6 +541,8 @@ class SettingsInterface(ScrollArea):
                                  self.tts_device_combo.currentText()))
         self.tts_rate_spin.valueChanged.connect(
             lambda v: self._save("output", "tts_rate", v))
+        self.tts_volume_spin.valueChanged.connect(
+            lambda v: self._save("output", "tts_volume", v))
         self.mic_device_combo.currentIndexChanged.connect(self._on_mic_device_changed)
         self.isolate_switch.checkedChanged.connect(
             lambda checked: self._save(
@@ -656,6 +665,12 @@ class SettingsInterface(ScrollArea):
         """由字幕上的語速拖桿回寫，同步設定頁的顯示。"""
         self._loading = True
         self.tts_rate_spin.setValue(int(value))
+        self._loading = False
+
+    def set_tts_volume(self, value: int):
+        """由字幕上的音量拖桿回寫，同步設定頁的顯示。"""
+        self._loading = True
+        self.tts_volume_spin.setValue(int(value))
         self._loading = False
 
     def set_float_input_checked(self, checked: bool):

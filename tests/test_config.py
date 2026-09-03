@@ -75,3 +75,9 @@ def test_reset_restores_system_captions(tmp_path):
     cfg.reset_to_defaults()
     assert cfg.get("system_captions", "enabled") is False
     assert cfg.get("system_captions", "engine") == "nllb-600m"
+
+
+def test_output_tts_volume_default(tmp_path):
+    from app.config import Config
+    cfg = Config(tmp_path / "config.json")
+    assert cfg.get("output", "tts_volume") == 100
